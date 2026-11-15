@@ -1,6 +1,7 @@
 package node_test
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/rand"
@@ -18,6 +19,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/pires/go-proxyproto"
 	"golang.org/x/crypto/curve25519"
 	"google.golang.org/protobuf/types/known/anypb"
 
@@ -616,5 +618,216 @@ func TestDeviceLimitAndRouteBlocking(t *testing.T) {
 	action, _ = tracker.MatchRoute(v2net.TCPDestination(v2net.ParseAddress("allowed.example.com"), 443), "tcp")
 	if action != "" {
 		t.Fatalf("expected allowed.example.com to pass, got %q", action)
+	}
+}
+
+func TestProxyProtocolV1AndV2SendAndReceive(t *testing.T) {
+	// 1. Unit verification of Proxy Protocol v1 and v2 wire headers
+	for _, ver := range []int{1, 2} {
+		var buf bytes.Buffer
+		src := &net.TCPAddr{IP: net.ParseIP("203.0.113.88"), Port: 54321}
+		dst := &net.TCPAddr{IP: net.ParseIP("198.51.100.10"), Port: 443}
+		if err := transportext.WriteProxyProtocolHeader(&buf, ver, src, dst); err != nil {
+			t.Fatalf("WriteProxyProtocolHeader(v%d) failed: %v", ver, err)
+		}
+		hdr, err := proxyproto.Read(bufio.NewReader(&buf))
+		if err != nil {
+			t.Fatalf("proxyproto.Read(v%d) failed: %v", ver, err)
+		}
+		if int(hdr.Version) != ver {
+			t.Fatalf("expected header version %d, got %d", ver, hdr.Version)
+		}
+		gotSrc, ok := hdr.SourceAddr.(*net.TCPAddr)
+		if !ok || !gotSrc.IP.Equal(src.IP) || gotSrc.Port != src.Port {
+			t.Fatalf("v%d source addr mismatch: got %v, want %v", ver, hdr.SourceAddr, src)
+		}
+	}
+
+	// 2. End-to-End verification: Inbound Proxy Protocol (v1 & v2) -> MX Node -> Outbound Proxy Protocol (v1 & v2)
+	for _, ver := range []int{1, 2} {
+		t.Run(fmt.Sprintf("E2E_ProxyProtocol_v%d", ver), func(t *testing.T) {
+			rawLn, err := net.Listen("tcp", "127.0.0.1:0")
+			if err != nil {
+				t.Fatalf("listen downstream: %v", err)
+			}
+			defer rawLn.Close()
+			downstreamPort := rawLn.Addr().(*net.TCPAddr).Port
+
+			var (
+				observedVer  byte
+				observedSrc  string
+				observedMu   sync.Mutex
+				downstreamCh = make(chan struct{}, 1)
+			)
+
+			go func() {
+				for {
+					c, err := rawLn.Accept()
+					if err != nil {
+						return
+					}
+					go func(conn net.Conn) {
+						defer conn.Close()
+						br := bufio.NewReader(conn)
+						hdr, err := proxyproto.Read(br)
+						if err != nil {
+							return
+						}
+						observedMu.Lock()
+						observedVer = hdr.Version
+						if hdr.SourceAddr != nil {
+							observedSrc = hdr.SourceAddr.String()
+						}
+						observedMu.Unlock()
+						select {
+						case downstreamCh <- struct{}{}:
+						default:
+						}
+						_, _ = io.Copy(conn, br)
+					}(c)
+				}
+			}()
+
+			serverPort := getFreePort(t)
+			acceptTrue := true
+			engine := node.NewNodeEngine(node.EngineOptions{
+				NodeID:              300 + ver,
+				LogLevel:            "none",
+				ListenIP:            "127.0.0.1",
+				ProxyProtocol:       ver,
+				AcceptProxyProtocol: &acceptTrue,
+			})
+			defer engine.Close()
+
+			userUUID := "99999999-8888-7777-6666-555555555555"
+			users := []panel.User{{ID: 77, UUID: userUUID}}
+			nodeCfg := &panel.NodeConfig{
+				Host:       "127.0.0.1",
+				ListenIP:   "127.0.0.1",
+				ServerPort: serverPort,
+				Network:    "ws",
+				NetworkSettings: panel.NetworkSettings{
+					Path:                "/pp-ws",
+					AcceptProxyProtocol: true,
+					ProxyProtocol:       panel.FlexibleProxyProtocol(ver),
+				},
+				Protocol: "mx",
+				TLS:      0,
+			}
+
+			if _, err := engine.ApplyConfig(nodeCfg, users); err != nil {
+				t.Fatalf("ApplyConfig failed: %v", err)
+			}
+
+			msg := []byte(fmt.Sprintf("proxy-protocol-v%d-payload", ver))
+			ns := panel.NetworkSettings{
+				Path:          "/pp-ws",
+				ProxyProtocol: panel.FlexibleProxyProtocol(ver),
+			}
+			// Dial via MX client which also sends Proxy Protocol header on its dialer
+			tc, err := transportext.EncodeTransportSettings(transportext.ExtendedTransportSettings{
+				Network:       transportext.ProtocolWS,
+				Path:          ns.Path,
+				ProxyProtocol: ver,
+			})
+			if err != nil {
+				t.Fatalf("EncodeTransportSettings: %v", err)
+			}
+
+			forwardPort := getFreePort(t)
+			clientCoreCfg := &core.Config{
+				App: []*anypb.Any{
+					serial.ToTypedMessage(&dispatcher.Config{}),
+					serial.ToTypedMessage(&proxyman.InboundConfig{}),
+					serial.ToTypedMessage(&proxyman.OutboundConfig{}),
+				},
+				Inbound: []*core.InboundHandlerConfig{
+					{
+						Tag: "doko-in",
+						ReceiverSettings: serial.ToTypedMessage(&proxyman.ReceiverConfig{
+							PortRange: v2net.SinglePortRange(v2net.Port(forwardPort)),
+							Listen:    v2net.NewIPOrDomain(v2net.LocalHostIP),
+						}),
+						ProxySettings: serial.ToTypedMessage(&dokodemo.Config{
+							Address:  v2net.NewIPOrDomain(v2net.LocalHostIP),
+							Port:     uint32(downstreamPort),
+							Networks: []v2net.Network{v2net.Network_TCP},
+						}),
+					},
+				},
+				Outbound: []*core.OutboundHandlerConfig{
+					{
+						Tag: "mx-out",
+						SenderSettings: serial.ToTypedMessage(&proxyman.SenderConfig{
+							StreamSettings: &internet.StreamConfig{
+								ProtocolName:      transportext.ProtocolWS,
+								TransportSettings: []*internet.TransportConfig{tc},
+							},
+						}),
+						ProxySettings: serial.ToTypedMessage(&mx.ConfiguracionCliente{
+							Vnext: []*protocol.ServerEndpoint{
+								{
+									Address: v2net.NewIPOrDomain(v2net.LocalHostIP),
+									Port:    uint32(serverPort),
+									User: []*protocol.User{
+										{
+											Level:   0,
+											Email:   "client@mx",
+											Account: serial.ToTypedMessage(&mx.Cuenta{Id: userUUID}),
+										},
+									},
+								},
+							},
+						}),
+					},
+				},
+			}
+
+			inst, err := core.New(clientCoreCfg)
+			if err != nil {
+				t.Fatalf("core.New: %v", err)
+			}
+			if err := inst.Start(); err != nil {
+				_ = inst.Close()
+				t.Fatalf("inst.Start: %v", err)
+			}
+			defer inst.Close()
+
+			conn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", forwardPort), 3*time.Second)
+			if err != nil {
+				t.Fatalf("dial forwardPort: %v", err)
+			}
+			defer conn.Close()
+			_ = conn.SetDeadline(time.Now().Add(4 * time.Second))
+
+			if _, err := conn.Write(msg); err != nil {
+				t.Fatalf("write: %v", err)
+			}
+			reply := make([]byte, len(msg))
+			if _, err := io.ReadFull(conn, reply); err != nil {
+				t.Fatalf("read: %v", err)
+			}
+			if !bytes.Equal(reply, msg) {
+				t.Fatalf("echo mismatch: got %q, want %q", reply, msg)
+			}
+
+			select {
+			case <-downstreamCh:
+			case <-time.After(2 * time.Second):
+				t.Fatalf("timed out waiting for downstream Proxy Protocol v%d header", ver)
+			}
+
+			observedMu.Lock()
+			gotVer := int(observedVer)
+			gotSrc := observedSrc
+			observedMu.Unlock()
+
+			if gotVer != ver {
+				t.Fatalf("downstream received Proxy Protocol version %d, want %d", gotVer, ver)
+			}
+			if !strings.HasPrefix(gotSrc, "127.0.0.1:") {
+				t.Fatalf("downstream received unexpected source address %q", gotSrc)
+			}
+		})
 	}
 }

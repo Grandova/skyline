@@ -41,12 +41,15 @@ import (
 
 // EngineOptions holds local overrides for a node engine.
 type EngineOptions struct {
-	NodeID    int
-	LogLevel  string
-	ListenIP  string
-	CertFile  string
-	KeyFile   string
-	DeviceTTL time.Duration
+	NodeID              int
+	LogLevel            string
+	ListenIP            string
+	CertFile            string
+	KeyFile             string
+	ProxyProtocol       int
+	AcceptProxyProtocol *bool
+	ForwardAddress      string
+	DeviceTTL           time.Duration
 }
 
 // NodeEngine manages the V2Ray core.Instance and MX protocol inbound for a single Xboard node.
@@ -340,6 +343,7 @@ func (e *NodeEngine) getUserManagerLocked() (proxy.UserManager, error) {
 func (e *NodeEngine) buildCoreConfig(nodeCfg *panel.NodeConfig, users []panel.User) (*core.Config, error) {
 	transportext.RegisterAll()
 	RegisterSkylineDispatcher()
+	RegisterSkylineOutbound()
 
 	listenIP := strings.TrimSpace(e.opts.ListenIP)
 	if listenIP == "" {
@@ -402,6 +406,25 @@ func (e *NodeEngine) buildCoreConfig(nodeCfg *panel.NodeConfig, users []panel.Us
 		},
 	}
 
+	proxyProto := e.opts.ProxyProtocol
+	if proxyProto == 0 && nodeCfg.NetworkSettings.ProxyProtocol.Int() > 0 {
+		proxyProto = nodeCfg.NetworkSettings.ProxyProtocol.Int()
+	}
+	forwardAddr := strings.TrimSpace(e.opts.ForwardAddress)
+	if forwardAddr == "" {
+		forwardAddr = strings.TrimSpace(nodeCfg.NetworkSettings.ForwardAddress)
+	}
+
+	var directProxySettings *anypb.Any
+	if proxyProto > 0 || forwardAddr != "" {
+		directProxySettings = EncodeSkylineOutboundSettings(SkylineOutboundSettings{
+			ProxyProtocol:  proxyProto,
+			ForwardAddress: forwardAddr,
+		})
+	} else {
+		directProxySettings = serial.ToTypedMessage(&freedom.Config{})
+	}
+
 	return &core.Config{
 		App: []*anypb.Any{
 			serial.ToTypedMessage(buildLogConfig(e.opts.LogLevel)),
@@ -421,7 +444,7 @@ func (e *NodeEngine) buildCoreConfig(nodeCfg *panel.NodeConfig, users []panel.Us
 		Outbound: []*core.OutboundHandlerConfig{
 			{
 				Tag:           "direct",
-				ProxySettings: serial.ToTypedMessage(&freedom.Config{}),
+				ProxySettings: directProxySettings,
 			},
 			{
 				Tag:           "block",
@@ -438,9 +461,18 @@ func (e *NodeEngine) buildStreamConfig(nodeCfg *panel.NodeConfig) (*internet.Str
 	}
 
 	ns := nodeCfg.NetworkSettings
+	acceptPP := ns.AcceptProxyProtocol.Bool()
+	if e.opts.AcceptProxyProtocol != nil {
+		acceptPP = *e.opts.AcceptProxyProtocol || acceptPP
+	}
+	proxyProto := e.opts.ProxyProtocol
+	if proxyProto == 0 && ns.ProxyProtocol.Int() > 0 {
+		proxyProto = ns.ProxyProtocol.Int()
+	}
+
 	streamCfg := &internet.StreamConfig{
 		SocketSettings: &internet.SocketConfig{
-			AcceptProxyProtocol: ns.AcceptProxyProtocol.Bool(),
+			AcceptProxyProtocol: acceptPP,
 		},
 	}
 
@@ -451,7 +483,7 @@ func (e *NodeEngine) buildStreamConfig(nodeCfg *panel.NodeConfig) (*internet.Str
 			{
 				ProtocolName: "tcp",
 				Settings: serial.ToTypedMessage(&tcp.Config{
-					AcceptProxyProtocol: ns.AcceptProxyProtocol.Bool(),
+					AcceptProxyProtocol: acceptPP,
 				}),
 			},
 		}
@@ -466,7 +498,10 @@ func (e *NodeEngine) buildStreamConfig(nodeCfg *panel.NodeConfig) (*internet.Str
 			Path:                wsPath,
 			Host:                ns.Host,
 			Headers:             ns.Headers,
-			AcceptProxyProtocol: ns.AcceptProxyProtocol.Bool(),
+			AcceptProxyProtocol: acceptPP,
+			ProxyProtocol:       proxyProto,
+			MaxEarlyData:        ns.MaxEarlyData,
+			EarlyDataHeaderName: ns.EarlyDataHeaderName,
 		})
 		if err != nil {
 			return nil, err
@@ -500,9 +535,12 @@ func (e *NodeEngine) buildStreamConfig(nodeCfg *panel.NodeConfig) (*internet.Str
 			CertificateFingerprint: ns.CertificateFingerprint,
 			FakeTitle:              ns.FakeTitle,
 			FakeMessage:            ns.FakeMessage,
-			AcceptProxyProtocol:    ns.AcceptProxyProtocol.Bool(),
+			AcceptProxyProtocol:    acceptPP,
+			ProxyProtocol:          proxyProto,
 			UseTLSCertificate:      ns.UseTLSCertificate.Bool(),
 			CIDRSegments:           []string(ns.CIDRSegments),
+			MaxEarlyData:           ns.MaxEarlyData,
+			EarlyDataHeaderName:    ns.EarlyDataHeaderName,
 		})
 		if err != nil {
 			return nil, err

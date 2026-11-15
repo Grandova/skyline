@@ -43,12 +43,15 @@ func NewNodeWorker(target config.NodeTargetConfig, logger *log.Logger) *NodeWork
 		Timeout:    target.HTTPTimeout,
 	})
 	engine := NewNodeEngine(EngineOptions{
-		NodeID:    target.NodeID,
-		LogLevel:  target.LogLevel,
-		ListenIP:  target.ListenIP,
-		CertFile:  target.CertFile,
-		KeyFile:   target.KeyFile,
-		DeviceTTL: target.DeviceTTL,
+		NodeID:              target.NodeID,
+		LogLevel:            target.LogLevel,
+		ListenIP:            target.ListenIP,
+		CertFile:            target.CertFile,
+		KeyFile:             target.KeyFile,
+		ProxyProtocol:       target.ProxyProtocol.Int(),
+		AcceptProxyProtocol: target.AcceptProxyProtocol,
+		ForwardAddress:      target.ForwardAddress,
+		DeviceTTL:           target.DeviceTTL,
 	})
 	pullInt := target.PullInterval
 	if pullInt <= 0 {
@@ -380,19 +383,22 @@ func (m *Manager) syncMachineNodes(ctx context.Context) error {
 	for id := range desired {
 		if _, exists := m.workers[id]; !exists {
 			target := config.NodeTargetConfig{
-				PanelURL:     m.cfg.PanelURL,
-				Token:        m.cfg.Token,
-				NodeID:       id,
-				NodeType:     "mx",
-				MachineID:    m.cfg.MachineID,
-				APIVersion:   m.cfg.APIVersion,
-				ListenIP:     m.cfg.ListenIP,
-				CertFile:     m.cfg.CertFile,
-				KeyFile:      m.cfg.KeyFile,
-				PullInterval: m.cfg.PullInterval,
-				PushInterval: m.cfg.PushInterval,
-				HTTPTimeout:  m.cfg.HTTPTimeout,
-				DeviceTTL:    m.cfg.DeviceTTL,
+				PanelURL:            m.cfg.PanelURL,
+				Token:               m.cfg.Token,
+				NodeID:              id,
+				NodeType:            "mx",
+				MachineID:           m.cfg.MachineID,
+				APIVersion:          m.cfg.APIVersion,
+				ListenIP:            m.cfg.ListenIP,
+				CertFile:            m.cfg.CertFile,
+				KeyFile:             m.cfg.KeyFile,
+				ProxyProtocol:       m.cfg.ProxyProtocol,
+				AcceptProxyProtocol: m.cfg.AcceptProxyProtocol,
+				ForwardAddress:      m.cfg.ForwardAddress,
+				PullInterval:        m.cfg.PullInterval,
+				PushInterval:        m.cfg.PushInterval,
+				HTTPTimeout:         m.cfg.HTTPTimeout,
+				DeviceTTL:           m.cfg.DeviceTTL,
 			}
 			w := NewNodeWorker(target, m.logger)
 			m.workers[id] = w

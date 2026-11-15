@@ -14,8 +14,11 @@ import (
 	"github.com/v2fly/v2ray-core/v5/common/protocol"
 	udp_proto "github.com/v2fly/v2ray-core/v5/common/protocol/udp"
 	"github.com/v2fly/v2ray-core/v5/common/session"
+	"github.com/v2fly/v2ray-core/v5/common/signal"
+	"github.com/v2fly/v2ray-core/v5/common/task"
 	"github.com/v2fly/v2ray-core/v5/features/policy"
 	"github.com/v2fly/v2ray-core/v5/features/routing"
+	"github.com/v2fly/v2ray-core/v5/transport"
 	"github.com/v2fly/v2ray-core/v5/transport/internet"
 	udp "github.com/v2fly/v2ray-core/v5/transport/internet/udp"
 )
@@ -64,6 +67,10 @@ func (*Servidor) Network() []net.Network {
 }
 
 func (s *Servidor) Process(ctx context.Context, _ net.Network, conexion internet.Connection, despachador routing.Dispatcher) error {
+	if resultado := ResultadoAutenticacionRapidaFromContext(ctx); resultado != nil && resultado.Protocolo == "mx" && resultado.Usuario != nil && resultado.Destino.IsValid() {
+		return s.procesarRapido(ctx, conexion, despachador, resultado)
+	}
+
 	if wrapper := UnwrapFastAuth(conexion); wrapper != nil &&
 		wrapper.FastAuthResult != nil &&
 		wrapper.FastAuthResult.Status == FastAuthStatusOK &&
@@ -71,10 +78,16 @@ func (s *Servidor) Process(ctx context.Context, _ net.Network, conexion internet
 		wrapper.FastAuthTarget.IsValid() {
 		usuario := s.validador.Buscar(wrapper.FastAuthToken)
 		if usuario == nil {
-			usuario = wrapper.FastAuthUser
+			if u, ok := wrapper.FastAuthUser.(*protocol.MemoryUser); ok {
+				usuario = u
+			}
 		}
 		if usuario != nil {
-			return s.procesarRapido(ctx, conexion, despachador, usuario, wrapper.FastAuthTarget)
+			return s.procesarRapido(ctx, conexion, despachador, &ResultadoAutenticacionRapida{
+				Protocolo: wrapper.FastAuthProtocol,
+				Usuario:   usuario,
+				Destino:   wrapper.FastAuthTarget,
+			})
 		}
 	}
 
@@ -129,27 +142,41 @@ func (s *Servidor) procesarRapido(
 	ctx context.Context,
 	conexion internet.Connection,
 	despachador routing.Dispatcher,
-	usuario *protocol.MemoryUser,
-	destino net.Destination,
+	resultado *ResultadoAutenticacionRapida,
 ) error {
 	inbound := session.InboundFromContext(ctx)
 	if inbound != nil {
-		inbound.User = usuario
+		inbound.User = resultado.Usuario
 	}
 
-	sesionPolitica := s.politicas.ForLevel(usuario.Level)
+	sesionPolitica := s.politicas.ForLevel(resultado.Usuario.Level)
 	ctx = policy.ContextWithBufferPolicy(ctx, sesionPolitica.Buffer)
 
-	if destino.Network == net.Network_UDP {
-		if _, err := packetaddr.GetDestinationSubsetOf(destino); err == nil {
+	if resultado.Destino.Network == net.Network_UDP {
+		if _, err := packetaddr.GetDestinationSubsetOf(resultado.Destino); err == nil {
+			if resultado.Enlace != nil {
+				return s.procesarUDPDirigidoConEnlace(ctx, conexion, resultado.Enlace, resultado.Destino, sesionPolitica)
+			}
 			return s.procesarUDPDirigido(ctx, conexion, despachador)
 		}
-		return s.procesarUDPFijo(ctx, conexion, despachador, destino)
+		if resultado.Enlace != nil {
+			return relevarConexion(
+				ctx,
+				sesionPolitica,
+				ladoCopia{lector: &lectorPaqueteTamano{Reader: conexion}, escritor: resultado.Enlace.Writer, cerrarSalida: true},
+				ladoCopia{lector: resultado.Enlace.Reader, escritor: &escritorPaqueteTamano{Writer: conexion}},
+			)
+		}
+		return s.procesarUDPFijo(ctx, conexion, despachador, resultado.Destino)
 	}
 
-	enlace, err := despachador.Dispatch(ctx, destino)
-	if err != nil {
-		return errors.New("mx: no se pudo despachar").Base(err)
+	enlace := resultado.Enlace
+	if enlace == nil {
+		var err error
+		enlace, err = despachador.Dispatch(ctx, resultado.Destino)
+		if err != nil {
+			return errors.New("mx: no se pudo despachar").Base(err)
+		}
 	}
 
 	return relevarConexion(
@@ -217,6 +244,42 @@ func (s *Servidor) procesarUDPDirigido(
 			servidor.Dispatch(ctx, paquete.destino, b)
 		}
 	}
+}
+
+func (s *Servidor) procesarUDPDirigidoConEnlace(
+	ctx context.Context,
+	conexion internet.Connection,
+	enlace *transport.Link,
+	destino net.Destination,
+	sesionPolitica policy.Session,
+) error {
+	flujo, err := packetaddr.ToPacketAddrConn(enlace, destino)
+	if err != nil {
+		return err
+	}
+	defer flujo.Close()
+
+	ctx, cancelar := context.WithCancel(ctx)
+	defer cancelar()
+
+	temporizador := signal.CancelAfterInactivity(ctx, cancelar, sesionPolitica.Timeouts.ConnectionIdle)
+
+	subida := func() error {
+		defer temporizador.SetTimeout(sesionPolitica.Timeouts.DownlinkOnly)
+		lector := &lectorConexionPaquete{lector: &lectorPaqueteDireccionado{Reader: conexion}}
+		return udp.CopyPacketConn(flujo, lector, udp.UpdateActivity(temporizador))
+	}
+
+	bajada := func() error {
+		defer temporizador.SetTimeout(sesionPolitica.Timeouts.UplinkOnly)
+		escritor := &escritorPaqueteDireccionado{Writer: conexion}
+		return udp.CopyPacketConn(escritor, flujo, udp.UpdateActivity(temporizador))
+	}
+
+	if err := task.Run(ctx, subida, bajada); err != nil {
+		return errors.New("mx: conexion finalizada").Base(err)
+	}
+	return nil
 }
 
 func init() {

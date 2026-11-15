@@ -1,26 +1,55 @@
-# Skyline MX 协议后端配置文件示例 (YAML)
+# =============================================================================
+# Skyline MX 协议后端配置文件 (/etc/skyline/config.yml)
+# 程序路径: /etc/skyline/skyline
+# 配置路径: /etc/skyline/config.yml
+# 修改本文件后可执行 `skyline service reload` 或 `systemctl restart skyline` 生效
+# =============================================================================
+
 log_level: info
 
-# 单节点模式配置（若配置了 nodes 列表，以下字段作为各节点的默认值）
+# 单节点模式配置（若配置了 nodes 列表，以下字段作为各节点的全局默认值）
 panel_url: https://your-xboard-panel.example.com
 token: your-xboard-server-token
 node_id: 1
 node_type: mx
 api_version: v1          # 可选: v1 (/api/v1/server/UniProxy/*), v2 (/api/v2/server/*), auto
 # machine_id: 0          # 可选: Xboard V2 机器 ID（仅配置 machine_id 时将自动拉取机器下所有 mx 节点）
-# listen_ip: 0.0.0.0     # 可选: 覆盖面板下发的监听 IP
-# cert_file: /path/to/fullchain.pem  # 可选: TLS 证书文件路径（未提供时将自动按 SNI/Host 签发内存证书）
-# key_file: /path/to/privkey.pem     # 可选: TLS 私钥文件路径
+listen_ip: 0.0.0.0       # 可选: 覆盖面板下发的监听 IP
+# cert_file: /etc/skyline/fullchain.pem  # 可选: TLS 证书文件路径（未提供时自动按 SNI/Host 签发内存证书）
+# key_file: /etc/skyline/privkey.pem     # 可选: TLS 私钥文件路径
+pull_interval: 60s
+push_interval: 60s
 http_timeout: 15s
 device_ttl: 90s
 
+# -----------------------------------------------------------------------------
+# Proxy Protocol v1 & v2 协议头配置（支持发送与接收，也可在 nodes 列表中按节点单独设置）
+# -----------------------------------------------------------------------------
+# proxy_protocol: 控制出站连接是否发送 Proxy Protocol 协议头（携带真实客户端源 IP:Port）
+#   可选值:
+#     0 / off : 不发送 Proxy Protocol 协议头（默认）
+#     1 / v1  : 发送 Proxy Protocol v1 文本协议头 (PROXY TCP4/TCP6 ...)
+#     2 / v2  : 发送 Proxy Protocol v2 二进制协议头
+proxy_protocol: 0
+
+# accept_proxy_protocol: 控制入站监听是否接收并解析前端(如 Nginx/HAProxy/中转机)发来的 Proxy Protocol v1/v2 协议头
+accept_proxy_protocol: false
+
+# forward_address: 可选，将节点出站连接固定转发至指定下游/落地地址 (例如 "127.0.0.1:8443")，常与 proxy_protocol: v1/v2 配合使用
+# forward_address: "127.0.0.1:8443"
+
+# -----------------------------------------------------------------------------
 # 多节点模式配置示例（如需单进程同时对接多个 MX 节点，可取消下方注释）
+# -----------------------------------------------------------------------------
 # nodes:
 #   - node_id: 1
 #     node_type: mx
 #     panel_url: https://your-xboard-panel.example.com
 #     token: your-xboard-server-token
+#     proxy_protocol: v1
+#     accept_proxy_protocol: true
 #   - node_id: 2
 #     node_type: mx
+#     proxy_protocol: v2
 #     cert_file: /etc/skyline/node2.crt
 #     key_file: /etc/skyline/node2.key

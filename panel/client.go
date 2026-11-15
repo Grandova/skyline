@@ -90,21 +90,53 @@ func isEmptyJSONArrayOrNull(data []byte) bool {
 	return len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) || bytes.Equal(trimmed, []byte("[]"))
 }
 
+// FlexibleProxyProtocol unmarshals Proxy Protocol version (0, 1, 2) from int, string ("v1", "v2", "1", "2", "off"), or bool.
+type FlexibleProxyProtocol int
+
+func (p *FlexibleProxyProtocol) UnmarshalJSON(data []byte) error {
+	s := strings.ToLower(strings.Trim(strings.TrimSpace(string(data)), `"`))
+	switch s {
+	case "", "0", "false", "null", "off", "none", "disable", "disabled":
+		*p = 0
+		return nil
+	case "1", "v1", "true":
+		*p = 1
+		return nil
+	case "2", "v2":
+		*p = 2
+		return nil
+	default:
+		if n, err := strconv.Atoi(s); err == nil && (n == 0 || n == 1 || n == 2) {
+			*p = FlexibleProxyProtocol(n)
+			return nil
+		}
+		return fmt.Errorf("invalid proxy_protocol value %q (must be 0, 1, 2, v1, or v2)", string(data))
+	}
+}
+
+func (p FlexibleProxyProtocol) Int() int {
+	return int(p)
+}
+
 // NetworkSettings holds transport-specific settings for MX protocol.
 type NetworkSettings struct {
-	Path                   string            `json:"path,omitempty"`
-	Host                   string            `json:"host,omitempty"`
-	Headers                map[string]string `json:"headers,omitempty"`
-	ServiceName            string            `json:"serviceName,omitempty"`
-	Mode                   string            `json:"mode,omitempty"`
-	Username               string            `json:"username,omitempty"`
-	CertificateFingerprint string            `json:"certificateFingerprint,omitempty"`
-	FakeTitle              string            `json:"fakeTitle,omitempty"`
-	FakeMessage            string            `json:"fakeMessage,omitempty"`
-	AcceptProxyProtocol    FlexibleBool      `json:"acceptProxyProtocol,omitempty"`
-	UseTLSCertificate      FlexibleBool      `json:"useTLSCertificate,omitempty"`
-	CIDRSegments           StringSlice       `json:"cidrSegments,omitempty"`
-	Split                  any               `json:"split,omitempty"`
+	Path                   string                `json:"path,omitempty"`
+	Host                   string                `json:"host,omitempty"`
+	Headers                map[string]string     `json:"headers,omitempty"`
+	ServiceName            string                `json:"serviceName,omitempty"`
+	Mode                   string                `json:"mode,omitempty"`
+	Username               string                `json:"username,omitempty"`
+	CertificateFingerprint string                `json:"certificateFingerprint,omitempty"`
+	FakeTitle              string                `json:"fakeTitle,omitempty"`
+	FakeMessage            string                `json:"fakeMessage,omitempty"`
+	AcceptProxyProtocol    FlexibleBool          `json:"acceptProxyProtocol,omitempty"`
+	ProxyProtocol          FlexibleProxyProtocol `json:"proxyProtocol,omitempty"`
+	ForwardAddress         string                `json:"forwardAddress,omitempty"`
+	UseTLSCertificate      FlexibleBool          `json:"useTLSCertificate,omitempty"`
+	CIDRSegments           StringSlice           `json:"cidrSegments,omitempty"`
+	MaxEarlyData           int32                 `json:"maxEarlyData,omitempty"`
+	EarlyDataHeaderName    string                `json:"earlyDataHeaderName,omitempty"`
+	Split                  any                   `json:"split,omitempty"`
 }
 
 func (n *NetworkSettings) UnmarshalJSON(data []byte) error {
@@ -113,11 +145,67 @@ func (n *NetworkSettings) UnmarshalJSON(data []byte) error {
 		return nil
 	}
 	type plain NetworkSettings
-	var p plain
-	if err := json.Unmarshal(data, &p); err != nil {
+	var raw struct {
+		plain
+		ServiceNameSnake            string                 `json:"service_name"`
+		CertificateFingerprintSnake string                 `json:"certificate_fingerprint"`
+		FakeTitleSnake              string                 `json:"fake_title"`
+		FakeMessageSnake            string                 `json:"fake_message"`
+		AcceptProxyProtocolSnake    *FlexibleBool          `json:"accept_proxy_protocol"`
+		ProxyProtocolSnake          *FlexibleProxyProtocol `json:"proxy_protocol"`
+		SendProxyProtocolCamel      *FlexibleProxyProtocol `json:"sendProxyProtocol"`
+		SendProxyProtocolSnake      *FlexibleProxyProtocol `json:"send_proxy_protocol"`
+		ForwardAddressSnake         string                 `json:"forward_address"`
+		UseTLSCertificateSnake      *FlexibleBool          `json:"use_tls_certificate"`
+		CIDRSegmentsSnake           StringSlice            `json:"cidr_segments"`
+		MaxEarlyDataSnake           int32                  `json:"max_early_data"`
+		EarlyDataHeaderNameSnake    string                 `json:"early_data_header_name"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
 		return err
 	}
-	*n = NetworkSettings(p)
+	out := NetworkSettings(raw.plain)
+	if out.ServiceName == "" && raw.ServiceNameSnake != "" {
+		out.ServiceName = raw.ServiceNameSnake
+	}
+	if out.CertificateFingerprint == "" && raw.CertificateFingerprintSnake != "" {
+		out.CertificateFingerprint = raw.CertificateFingerprintSnake
+	}
+	if out.FakeTitle == "" && raw.FakeTitleSnake != "" {
+		out.FakeTitle = raw.FakeTitleSnake
+	}
+	if out.FakeMessage == "" && raw.FakeMessageSnake != "" {
+		out.FakeMessage = raw.FakeMessageSnake
+	}
+	if !out.AcceptProxyProtocol.Bool() && raw.AcceptProxyProtocolSnake != nil {
+		out.AcceptProxyProtocol = *raw.AcceptProxyProtocolSnake
+	}
+	if out.ProxyProtocol == 0 {
+		switch {
+		case raw.ProxyProtocolSnake != nil && *raw.ProxyProtocolSnake > 0:
+			out.ProxyProtocol = *raw.ProxyProtocolSnake
+		case raw.SendProxyProtocolCamel != nil && *raw.SendProxyProtocolCamel > 0:
+			out.ProxyProtocol = *raw.SendProxyProtocolCamel
+		case raw.SendProxyProtocolSnake != nil && *raw.SendProxyProtocolSnake > 0:
+			out.ProxyProtocol = *raw.SendProxyProtocolSnake
+		}
+	}
+	if out.ForwardAddress == "" && raw.ForwardAddressSnake != "" {
+		out.ForwardAddress = raw.ForwardAddressSnake
+	}
+	if !out.UseTLSCertificate.Bool() && raw.UseTLSCertificateSnake != nil {
+		out.UseTLSCertificate = *raw.UseTLSCertificateSnake
+	}
+	if len(out.CIDRSegments) == 0 && len(raw.CIDRSegmentsSnake) > 0 {
+		out.CIDRSegments = raw.CIDRSegmentsSnake
+	}
+	if out.MaxEarlyData == 0 && raw.MaxEarlyDataSnake > 0 {
+		out.MaxEarlyData = raw.MaxEarlyDataSnake
+	}
+	if out.EarlyDataHeaderName == "" && raw.EarlyDataHeaderNameSnake != "" {
+		out.EarlyDataHeaderName = raw.EarlyDataHeaderNameSnake
+	}
+	*n = out
 	return nil
 }
 
@@ -268,7 +356,9 @@ func isEmptyNetworkSettings(n NetworkSettings) bool {
 		n.ServiceName == "" && n.Mode == "" && n.Username == "" &&
 		n.CertificateFingerprint == "" && n.FakeTitle == "" &&
 		n.FakeMessage == "" && !n.AcceptProxyProtocol.Bool() &&
-		!n.UseTLSCertificate.Bool() && len(n.CIDRSegments) == 0 && n.Split == nil
+		n.ProxyProtocol == 0 && n.ForwardAddress == "" &&
+		!n.UseTLSCertificate.Bool() && len(n.CIDRSegments) == 0 &&
+		n.MaxEarlyData == 0 && n.EarlyDataHeaderName == "" && n.Split == nil
 }
 
 func isEmptyTLSSettings(t TLSSettings) bool {

@@ -68,8 +68,11 @@ func (c *Cliente) Process(ctx context.Context, enlace *transport.Link, marcador 
 		return errors.New("mx: cuenta invalida")
 	}
 
+	sesionRapida := NuevaSesionAutenticacionRapida("mx", usuario, salida.Target)
+	ctxConexion := ContextWithSesionAutenticacionRapida(ctx, sesionRapida)
+
 	fastAuthPayload := buildFastAuthPayload(cuenta.Id, salida.Target)
-	ctxConexion := ContextWithFastAuthPayload(ctx, fastAuthPayload)
+	ctxConexion = ContextWithFastAuthPayload(ctxConexion, fastAuthPayload)
 
 	estadoRapido := proxyFastAuthState(cuenta.Id, servidor.Destination())
 	ctxConexion = ContextWithFastAuthState(ctxConexion, estadoRapido)
@@ -81,18 +84,20 @@ func (c *Cliente) Process(ctx context.Context, enlace *transport.Link, marcador 
 	defer conexion.Close()
 
 	observeFastAuthResult(conexion, estadoRapido)
-	omitirCabecera := estadoRapido.State() == FastAuthCapabilitySupported
+	if estadoRapido.State() == FastAuthCapabilitySupported {
+		sesionRapida.Activar()
+	}
 
 	sesionPolitica := c.politicas.ForLevel(usuario.Level)
 	if flujo, err := packetaddr.ToPacketAddrConn(enlace, salida.Target); err == nil {
-		return c.procesarUDPDirigido(ctx, sesionPolitica, conexion, flujo, enlace, cuenta.Id, salida.Target, omitirCabecera)
+		return c.procesarUDPDirigido(ctx, sesionPolitica, conexion, flujo, enlace, cuenta.Id, salida.Target, sesionRapida.OmiteCabecera())
 	}
 
 	if salida.Target.Network == net.Network_UDP {
-		return c.procesarUDPFijo(ctx, sesionPolitica, conexion, enlace, cuenta.Id, salida.Target, omitirCabecera)
+		return c.procesarUDPFijo(ctx, sesionPolitica, conexion, enlace, cuenta.Id, salida.Target, sesionRapida.OmiteCabecera())
 	}
 
-	if !omitirCabecera {
+	if !sesionRapida.OmiteCabecera() {
 		if err := escribirCabecera(conexion, cuenta.Id, salida.Target); err != nil {
 			return err
 		}

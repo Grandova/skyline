@@ -5,6 +5,9 @@
   "node_id": 1,
   "node_type": "mx",
   "api_version": "v1",
+  "listen_ip": "0.0.0.0",
+  "proxy_protocol": "v2",
+  "accept_proxy_protocol": false,
   "http_timeout": "15s",
   "device_ttl": "90s",
   "nodes": [
@@ -12,7 +15,9 @@
       "node_id": 1,
       "node_type": "mx",
       "panel_url": "https://your-xboard-panel.example.com",
-      "token": "your-xboard-server-token"
+      "token": "your-xboard-server-token",
+      "proxy_protocol": "v2",
+      "accept_proxy_protocol": false
     }
   ]
 }

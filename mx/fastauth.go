@@ -11,11 +11,13 @@ import (
 	"github.com/v2fly/v2ray-core/v5/common/errors"
 	"github.com/v2fly/v2ray-core/v5/common/net"
 	"github.com/v2fly/v2ray-core/v5/common/protocol"
+	"github.com/v2fly/v2ray-core/v5/transport"
 	"github.com/v2fly/v2ray-core/v5/transport/internet"
 )
 
 const (
 	FastAuthProtocol       = "mx"
+	 fastAuthProtocol      = "mx"
 	FastAuthRequestHeader  = "MundoConnect-Auth"
 	FastAuthResponseHeader = "MundoConnect-Response"
 	FastAuthVersionClassic = uint8(1)
@@ -74,12 +76,136 @@ func (p *FastAuthPayload) Arg(index int) string {
 	return p.Args[index]
 }
 
+func (p *FastAuthPayload) SetArg(index int, value string) {
+	if p == nil || index < 0 {
+		return
+	}
+	if index >= len(p.Args) {
+		next := make([]string, index+1)
+		copy(next, p.Args)
+		p.Args = next
+	}
+	p.Args[index] = value
+}
+
+type FastAuthPrepared struct {
+	link  interface{}
+	err   error
+	ready chan struct{}
+}
+
+func NewFastAuthPrepared() *FastAuthPrepared {
+	return &FastAuthPrepared{
+		ready: make(chan struct{}),
+	}
+}
+
+func (p *FastAuthPrepared) Complete(link interface{}, err error) {
+	if p == nil {
+		return
+	}
+	p.link = link
+	p.err = err
+	close(p.ready)
+}
+
+func (p *FastAuthPrepared) Wait() (interface{}, error) {
+	if p == nil {
+		return nil, nil
+	}
+	<-p.ready
+	return p.link, p.err
+}
+
 type FastAuthInbound struct {
 	Protocol             string
-	User                 *protocol.MemoryUser
-	Target               net.Destination
+	User                 interface{}
+	Target               interface{}
 	Args                 []string
+	Prepared             *FastAuthPrepared
 	ConsumeClassicHeader bool
+}
+
+func (i *FastAuthInbound) Arg(index int) string {
+	if i == nil || index < 0 || index >= len(i.Args) {
+		return ""
+	}
+	return i.Args[index]
+}
+
+func (i *FastAuthInbound) SetArg(index int, value string) {
+	if i == nil || index < 0 {
+		return
+	}
+	if index >= len(i.Args) {
+		next := make([]string, index+1)
+		copy(next, i.Args)
+		i.Args = next
+	}
+	i.Args[index] = value
+}
+
+type FastAuthValidator interface {
+	ValidateFastAuth(context.Context, *FastAuthPayload) (*FastAuthInbound, error)
+}
+
+// ResultadoAutenticacionRapida matches M-master/app/proxyman/rapido.go.
+type ResultadoAutenticacionRapida struct {
+	Protocolo string
+	Usuario   *protocol.MemoryUser
+	Destino   net.Destination
+	Enlace    *transport.Link
+}
+
+// SesionAutenticacionRapida matches M-master/app/proxyman/rapido.go.
+type SesionAutenticacionRapida struct {
+	Protocolo      string
+	Usuario        *protocol.MemoryUser
+	Destino        net.Destination
+	omitirCabecera bool
+}
+
+func NuevaSesionAutenticacionRapida(protocolo string, usuario *protocol.MemoryUser, destino net.Destination) *SesionAutenticacionRapida {
+	return &SesionAutenticacionRapida{
+		Protocolo: protocolo,
+		Usuario:   usuario,
+		Destino:   destino,
+	}
+}
+
+func (s *SesionAutenticacionRapida) Activar() {
+	s.omitirCabecera = true
+}
+
+func (s *SesionAutenticacionRapida) OmiteCabecera() bool {
+	return s != nil && s.omitirCabecera
+}
+
+type claveResultadoAutenticacionRapida struct{}
+type claveSesionAutenticacionRapida struct{}
+
+func ContextWithResultadoAutenticacionRapida(ctx context.Context, resultado *ResultadoAutenticacionRapida) context.Context {
+	return context.WithValue(ctx, claveResultadoAutenticacionRapida{}, resultado)
+}
+
+func ResultadoAutenticacionRapidaFromContext(ctx context.Context) *ResultadoAutenticacionRapida {
+	valor := ctx.Value(claveResultadoAutenticacionRapida{})
+	if valor == nil {
+		return nil
+	}
+	return valor.(*ResultadoAutenticacionRapida)
+}
+
+func ContextWithSesionAutenticacionRapida(ctx context.Context, sesion *SesionAutenticacionRapida) context.Context {
+	return context.WithValue(ctx, claveSesionAutenticacionRapida{}, sesion)
+}
+
+func SesionAutenticacionRapidaFromContext(ctx context.Context) *SesionAutenticacionRapida {
+	valor := ctx.Value(claveSesionAutenticacionRapida{})
+	if valor == nil {
+		return nil
+	}
+	return valor.(*SesionAutenticacionRapida)
 }
 
 type FastAuthResult struct {
@@ -90,7 +216,7 @@ type FastAuthConnWrapper struct {
 	internet.Connection
 	FastAuthProtocol string
 	FastAuthToken    string
-	FastAuthUser     *protocol.MemoryUser
+	FastAuthUser     interface{}
 	FastAuthTarget   net.Destination
 	FastAuthResult   *FastAuthResult
 }
@@ -116,6 +242,8 @@ func UnwrapFastAuth(conn internet.Connection) *FastAuthConnWrapper {
 }
 
 type fastAuthPayloadKey struct{}
+type fastAuthValidatorKey struct{}
+type fastAuthInboundKey struct{}
 type fastAuthStateKey struct{}
 
 func ContextWithFastAuthPayload(ctx context.Context, payload *FastAuthPayload) context.Context {
@@ -128,6 +256,30 @@ func ContextWithFastAuthPayload(ctx context.Context, payload *FastAuthPayload) c
 func FastAuthPayloadFromContext(ctx context.Context) *FastAuthPayload {
 	payload, _ := ctx.Value(fastAuthPayloadKey{}).(*FastAuthPayload)
 	return payload
+}
+
+func ContextWithFastAuthValidator(ctx context.Context, validator FastAuthValidator) context.Context {
+	if validator == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, fastAuthValidatorKey{}, validator)
+}
+
+func FastAuthValidatorFromContext(ctx context.Context) FastAuthValidator {
+	validator, _ := ctx.Value(fastAuthValidatorKey{}).(FastAuthValidator)
+	return validator
+}
+
+func ContextWithFastAuthInbound(ctx context.Context, inbound *FastAuthInbound) context.Context {
+	if inbound == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, fastAuthInboundKey{}, inbound)
+}
+
+func FastAuthInboundFromContext(ctx context.Context) *FastAuthInbound {
+	inbound, _ := ctx.Value(fastAuthInboundKey{}).(*FastAuthInbound)
+	return inbound
 }
 
 func ContextWithFastAuthState(ctx context.Context, state *FastAuthState) context.Context {
@@ -354,8 +506,12 @@ func unregisterServer(s *Servidor) {
 	activeServersMu.Unlock()
 }
 
-// ValidateFastAuthGlobal validates a FastAuth payload against active MX server instances.
+// ValidateFastAuthGlobal validates a FastAuth payload against context validator or active MX server instances.
 func ValidateFastAuthGlobal(ctx context.Context, payload *FastAuthPayload) (*FastAuthInbound, error) {
+	if v := FastAuthValidatorFromContext(ctx); v != nil {
+		return v.ValidateFastAuth(ctx, payload)
+	}
+
 	activeServersMu.RLock()
 	servers := make([]*Servidor, 0, len(activeServers))
 	for s := range activeServers {
@@ -416,7 +572,7 @@ func observeFastAuthResult(conn internet.Connection, state *FastAuthState) {
 func buildFastAuthPayload(token string, target net.Destination) *FastAuthPayload {
 	return &FastAuthPayload{
 		Version:    FastAuthVersionClassic,
-		Protocol:   FastAuthProtocol,
+		Protocol:   fastAuthProtocol,
 		AuthData:   token,
 		TargetHost: target.Address.String(),
 		TargetPort: target.Port.String(),
@@ -426,7 +582,7 @@ func buildFastAuthPayload(token string, target net.Destination) *FastAuthPayload
 }
 
 func parseFastAuthPayload(payload *FastAuthPayload) (net.Destination, string, error) {
-	if payload == nil || payload.Protocol != FastAuthProtocol {
+	if payload == nil || payload.Protocol != fastAuthProtocol {
 		return net.Destination{}, "", errors.New("mx: invalid fast auth protocol")
 	}
 	if payload.TargetHost == "" || payload.TargetPort == "" {
@@ -471,7 +627,7 @@ func (s *Servidor) ValidateFastAuth(_ context.Context, payload *FastAuthPayload)
 	}
 
 	return &FastAuthInbound{
-		Protocol:             FastAuthProtocol,
+		Protocol:             fastAuthProtocol,
 		User:                 user,
 		Target:               target,
 		Args:                 []string{payloadProtocol},

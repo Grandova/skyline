@@ -63,7 +63,14 @@ func promptLine(reader *bufio.Reader, label, defaultVal string) string {
 }
 
 // runInitCommand generates a Skyline YAML config interactively or via CLI flags.
-func runInitCommand(cfgPath, panelURL, token, nodeIDsStr string, singleNodeID, machineID int, apiVersion, listenIP, logLevel string, nonInteractive bool) error {
+func runInitCommand(
+	cfgPath, panelURL, token, nodeIDsStr string,
+	singleNodeID, machineID int,
+	apiVersion, listenIP, proxyProtocol string,
+	acceptProxyProtocol bool,
+	forwardAddress, logLevel string,
+	nonInteractive bool,
+) error {
 	if cfgPath == "" {
 		if runtime.GOOS == "linux" && os.Geteuid() == 0 {
 			cfgPath = "/etc/skyline/config.yml"
@@ -122,10 +129,17 @@ func runInitCommand(cfgPath, panelURL, token, nodeIDsStr string, singleNodeID, m
 		if listenIP == "" {
 			listenIP = promptLine(reader, "5. 请输入监听 IP 地址", "0.0.0.0")
 		}
-		if logLevel == "" {
-			logLevel = promptLine(reader, "6. 请输入日志级别 (debug / info / warning / error)", "info")
+		if proxyProtocol == "" {
+			proxyProtocol = promptLine(reader, "6. 是否开启发送 Proxy Protocol 协议头 (0=关闭, v1=Proxy Protocol v1, v2=Proxy Protocol v2)", "0")
 		}
-		cfgPath = promptLine(reader, "7. 配置文件保存路径", cfgPath)
+		accStr := promptLine(reader, "7. 是否开启接收解析入站 Proxy Protocol v1/v2 协议头 (y/N)", "N")
+		if strings.EqualFold(accStr, "y") || strings.EqualFold(accStr, "yes") || accStr == "1" || strings.EqualFold(accStr, "true") {
+			acceptProxyProtocol = true
+		}
+		if logLevel == "" {
+			logLevel = promptLine(reader, "8. 请输入日志级别 (debug / info / warning / error)", "info")
+		}
+		cfgPath = promptLine(reader, "9. 配置文件保存路径", cfgPath)
 	}
 
 	panelURL = strings.TrimRight(strings.TrimSpace(panelURL), "/")
@@ -144,13 +158,18 @@ func runInitCommand(cfgPath, panelURL, token, nodeIDsStr string, singleNodeID, m
 		logLevel = "info"
 	}
 
+	ppVer, err := config.ParseProxyProtocol(proxyProtocol)
+	if err != nil {
+		return err
+	}
+
 	if panelURL == "" || token == "" || (len(nodeIDs) == 0 && machineID <= 0) {
 		return fmt.Errorf("参数不完整：必须提供 --panel、--token 以及 --node-id（或 --node-ids / --machine-id）")
 	}
 
 	var b strings.Builder
 	b.WriteString("# =============================================================================\n")
-	b.WriteString("# Skyline MX Protocol Backend Configuration\n")
+	b.WriteString("# Skyline MX Protocol Backend Configuration (/etc/skyline/config.yml)\n")
 	b.WriteString(fmt.Sprintf("# Generated at: %s\n", time.Now().Format(time.RFC3339)))
 	b.WriteString("# =============================================================================\n\n")
 	b.WriteString(fmt.Sprintf("log_level: %s\n", logLevel))
@@ -162,6 +181,21 @@ func runInitCommand(cfgPath, panelURL, token, nodeIDsStr string, singleNodeID, m
 	b.WriteString("push_interval: 60s\n")
 	b.WriteString("http_timeout: 15s\n")
 	b.WriteString("device_ttl: 90s\n\n")
+
+	b.WriteString("# Proxy Protocol 协议头配置 (可直接在此修改并执行 skyline service reload 或 restart 生效)\n")
+	b.WriteString("# proxy_protocol: 控制出站连接是否发送 Proxy Protocol 协议头，可选值: 0 (关闭), v1 (或 1), v2 (或 2)\n")
+	if ppVer > 0 {
+		b.WriteString(fmt.Sprintf("proxy_protocol: v%d\n", ppVer.Int()))
+	} else {
+		b.WriteString("proxy_protocol: 0\n")
+	}
+	b.WriteString("# accept_proxy_protocol: 控制入站监听是否接收并解析前端转发的 Proxy Protocol v1/v2 协议头\n")
+	b.WriteString(fmt.Sprintf("accept_proxy_protocol: %v\n", acceptProxyProtocol))
+	if strings.TrimSpace(forwardAddress) != "" {
+		b.WriteString(fmt.Sprintf("forward_address: %q\n\n", strings.TrimSpace(forwardAddress)))
+	} else {
+		b.WriteString("# forward_address: \"127.0.0.1:8443\"  # 可选：将所有出站连接固定转发至指定下游地址（配合 proxy_protocol 发送真实客户端 IP）\n\n")
+	}
 
 	if machineID > 0 && len(nodeIDs) == 0 {
 		b.WriteString(fmt.Sprintf("machine_id: %d\n", machineID))
@@ -209,6 +243,7 @@ func runCheckCommand(cfg *config.Config) error {
 	fmt.Printf("  系统平台 : %s/%s (Go %s)\n", runtime.GOOS, runtime.GOARCH, runtime.Version())
 	fmt.Printf("  面板地址 : %s\n", cfg.PanelURL)
 	fmt.Printf("  API 模式 : %s\n", cfg.APIVersion)
+	fmt.Printf("  发送协议头 (Proxy Protocol) : %s\n", transportext.FormatProxyProtocolVersion(cfg.ProxyProtocol.Int()))
 	fmt.Println("--------------------------------------------------------")
 
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
@@ -234,15 +269,18 @@ func runCheckCommand(cfg *config.Config) error {
 		for _, n := range resp.Nodes {
 			if strings.EqualFold(n.Type, "mx") {
 				targets = append(targets, config.NodeTargetConfig{
-					PanelURL:   cfg.PanelURL,
-					Token:      cfg.Token,
-					NodeID:     n.ID,
-					NodeType:   "mx",
-					MachineID:  cfg.MachineID,
-					APIVersion: cfg.APIVersion,
-					ListenIP:   cfg.ListenIP,
-					CertFile:   cfg.CertFile,
-					KeyFile:    cfg.KeyFile,
+					PanelURL:            cfg.PanelURL,
+					Token:               cfg.Token,
+					NodeID:              n.ID,
+					NodeType:            "mx",
+					MachineID:           cfg.MachineID,
+					APIVersion:          cfg.APIVersion,
+					ListenIP:            cfg.ListenIP,
+					CertFile:            cfg.CertFile,
+					KeyFile:             cfg.KeyFile,
+					ProxyProtocol:       cfg.ProxyProtocol,
+					AcceptProxyProtocol: cfg.AcceptProxyProtocol,
+					ForwardAddress:      cfg.ForwardAddress,
 				})
 			}
 		}
@@ -283,8 +321,17 @@ func runCheckCommand(cfg *config.Config) error {
 		case 2:
 			tlsDesc = fmt.Sprintf("REALITY (SNI=%s, ShortID=%s)", nodeCfg.TLSSettings.ServerName, nodeCfg.TLSSettings.ShortID)
 		}
-		fmt.Printf("  [INFO] 节点配置摘要: 监听=%s:%d | 传输协议=%s | 安全模式=%s | 路由规则=%d条\n",
-			nodeCfg.ListenIP, nodeCfg.ServerPort, nodeCfg.Network, tlsDesc, len(nodeCfg.Routes))
+		sendPP := t.ProxyProtocol.Int()
+		if sendPP == 0 {
+			sendPP = nodeCfg.NetworkSettings.ProxyProtocol.Int()
+		}
+		acceptPP := nodeCfg.NetworkSettings.AcceptProxyProtocol.Bool()
+		if t.AcceptProxyProtocol != nil && *t.AcceptProxyProtocol {
+			acceptPP = true
+		}
+		fmt.Printf("  [INFO] 节点配置摘要: 监听=%s:%d | 传输协议=%s | 安全模式=%s | 发送PP=%s | 接收PP=%v | 路由规则=%d条\n",
+			nodeCfg.ListenIP, nodeCfg.ServerPort, nodeCfg.Network, tlsDesc,
+			transportext.FormatProxyProtocolVersion(sendPP), acceptPP, len(nodeCfg.Routes))
 
 		// Validate TLS / REALITY config locally
 		if nodeCfg.TLS == 2 {
@@ -361,6 +408,7 @@ func runCheckCommand(cfg *config.Config) error {
 }
 
 // runServiceCommand manages the Linux systemd service for Skyline.
+// Both the binary (/etc/skyline/skyline) and config (/etc/skyline/config.yml) live in /etc/skyline.
 func runServiceCommand(action string, cfgPath string) error {
 	if runtime.GOOS != "linux" {
 		return fmt.Errorf("`skyline service` 命令仅在 Linux 系统 (systemd) 下可用")
@@ -375,7 +423,9 @@ func runServiceCommand(action string, cfgPath string) error {
 	}
 
 	const (
-		targetBin   = "/usr/local/bin/skyline"
+		skylineDir  = "/etc/skyline"
+		targetBin   = "/etc/skyline/skyline"
+		symlinkBin  = "/usr/local/bin/skyline"
 		serviceFile = "/etc/systemd/system/skyline.service"
 	)
 
@@ -383,6 +433,9 @@ func runServiceCommand(action string, cfgPath string) error {
 	case "install":
 		if os.Geteuid() != 0 {
 			return fmt.Errorf("安装 systemd 服务需要 root 权限，请使用 sudo skyline service install")
+		}
+		if err := os.MkdirAll(skylineDir, 0755); err != nil {
+			return fmt.Errorf("创建目录 %s 失败: %w", skylineDir, err)
 		}
 		exePath, err := os.Executable()
 		if err != nil {
@@ -393,7 +446,12 @@ func runServiceCommand(action string, cfgPath string) error {
 			if err := copyExecutable(exePath, targetBin); err != nil {
 				return fmt.Errorf("复制二进制文件到 %s 失败: %w", targetBin, err)
 			}
-			fmt.Printf("[OK] 已安装二进制文件: %s\n", targetBin)
+			fmt.Printf("[OK] 已安装程序到目录: %s\n", targetBin)
+		}
+		// Create symlink in /usr/local/bin/skyline -> /etc/skyline/skyline for global CLI invocation
+		_ = os.Remove(symlinkBin)
+		if err := os.Symlink(targetBin, symlinkBin); err != nil {
+			_ = copyExecutable(targetBin, symlinkBin)
 		}
 
 		unitContent := fmt.Sprintf(`[Unit]
@@ -419,9 +477,6 @@ StandardError=journal
 WantedBy=multi-user.target
 `, targetBin, cfgPath)
 
-		if err := os.MkdirAll("/etc/skyline", 0755); err != nil {
-			return err
-		}
 		if err := os.WriteFile(serviceFile, []byte(unitContent), 0644); err != nil {
 			return fmt.Errorf("写入 %s 失败: %w", serviceFile, err)
 		}
@@ -437,7 +492,7 @@ WantedBy=multi-user.target
 			if err := runSystemctl("restart", "skyline"); err != nil {
 				return err
 			}
-			fmt.Println("[OK] Skyline 服务已启动并设置为开机自启！")
+			fmt.Println("[OK] Skyline 服务已启动并设置为开机自启！（程序与配置均位于 /etc/skyline）")
 			_ = runSystemctl("status", "--no-pager", "skyline")
 		} else {
 			fmt.Printf("[WARN] 尚未检测到配置文件 %s，请先运行 `skyline init` 生成配置后再执行 `skyline service start`。\n", cfgPath)
@@ -473,7 +528,7 @@ WantedBy=multi-user.target
 		return cmd.Run()
 
 	default:
-		return fmt.Errorf("未知的 service 子命令 %q（可选: install | uninstall | start | stop | restart | status | log）", action)
+		return fmt.Errorf("未知的 service 子命令 %q（可选: install | uninstall | start | stop | restart | reload | status | log）", action)
 	}
 }
 
@@ -511,49 +566,50 @@ func copyExecutable(src, dst string) error {
 func printUsage() {
 	fmt.Printf(`Skyline MX Protocol Backend v%s (M-core %s)
 专为 Xboard (MxProtocol 插件) 打造的 Linux 高性能 MX 协议后端代理程序
+程序与配置文件统一存放目录: /etc/skyline (/etc/skyline/skyline & /etc/skyline/config.yml)
 
 用法 (Usage):
   skyline [命令] [参数]
 
 核心命令 (Commands):
   run                启动 Skyline 节点后端守护进程（默认命令，可省略）
-  init               交互式向导或命令行一键生成 config.yml 配置文件
-  check / doctor     检测与 Xboard 面板连通性、核验密钥与节点 TLS/REALITY 配置
+  init               交互式向导或命令行一键生成 /etc/skyline/config.yml 配置文件
+  check / doctor     检测与 Xboard 面板连通性、核验密钥与节点 TLS/REALITY/ProxyProtocol 配置
   service <action>   管理 Linux systemd 服务:
-                       install   安装并启用开机自启服务
+                       install   安装程序至 /etc/skyline/skyline 并启用开机自启服务
                        uninstall 停止并移除 systemd 服务
                        start     启动服务
                        stop      停止服务
                        restart   重启服务
+                       reload    热重载配置文件 (/etc/skyline/config.yml)
                        status    查看服务运行状态
                        log       实时查看服务运行日志 (journalctl -f)
   version            显示版本与内核信息
   help               显示本帮助说明
 
 常用参数 (Flags):
-  -c, --config <path>       配置文件路径 (默认自动查找 ./config.yml 或 /etc/skyline/config.yml)
-  --panel <url>             Xboard 面板地址 (例如 https://panel.example.com)
-  --token <token>           Xboard 通讯密钥 (server_token 或 machine_token)
-  --node-id <id>            单个 MX 节点 ID
-  --node-ids <id1,id2,...>  多个 MX 节点 ID（逗号分隔，例如 1,2,3）
-  --machine-id <id>         Xboard V2 机器 ID（开启机器自动发现模式）
-  --api-version <v1|v2>     面板接口版本: v1 (默认 UniProxy) 或 v2
-  --listen-ip <ip>          覆盖监听 IP (默认 0.0.0.0)
-  --cert-file <path>        TLS 证书文件路径 (可选)
-  --key-file <path>         TLS 私钥文件路径 (可选)
-  --log-level <level>       日志级别: debug, info, warning, error, none
-  -y, --yes                 在 init 命令中使用非交互模式
+  -c, --config <path>           配置文件路径 (默认自动查找 /etc/skyline/config.yml)
+  --panel <url>                 Xboard 面板地址 (例如 https://panel.example.com)
+  --token <token>               Xboard 通讯密钥 (server_token 或 machine_token)
+  --node-id <id>                单个 MX 节点 ID
+  --node-ids <id1,id2,...>      多个 MX 节点 ID（逗号分隔，例如 1,2,3）
+  --machine-id <id>             Xboard V2 机器 ID（开启机器自动发现模式）
+  --api-version <v1|v2>         面板接口版本: v1 (默认 UniProxy) 或 v2
+  --listen-ip <ip>              覆盖监听 IP (默认 0.0.0.0)
+  --proxy-protocol <0|v1|v2>    发送 Proxy Protocol 协议头版本: 0(关闭), v1(或1), v2(或2)
+  --accept-proxy-protocol       开启接收并解析入站 Proxy Protocol v1 & v2 协议头
+  --forward-address <addr>      可选：固定出站转发目标地址 (如 127.0.0.1:8443)
+  --cert-file <path>            TLS 证书文件路径 (可选)
+  --key-file <path>             TLS 私钥文件路径 (可选)
+  --log-level <level>           日志级别: debug, info, warning, error, none
+  -y, --yes                     在 init 命令中使用非交互模式
 
 快速上手示例 (Examples):
-  1. 交互式初始化配置并自检:
+  1. 交互式初始化配置 (/etc/skyline/config.yml) 并自检:
      skyline init
 
-  2. 一行命令生成配置并安装启动 systemd 服务:
-     skyline init --panel https://panel.example.com --token YOUR_TOKEN --node-id 1 -y
-     skyline check
+  2. 一行命令生成配置（开启 Proxy Protocol v2 发送）并安装启动服务:
+     skyline init --panel https://panel.example.com --token YOUR_TOKEN --node-id 1 --proxy-protocol v2 -y
      sudo skyline service install
-
-  3. 免配置文件直接通过命令行参数启动单/多节点:
-     skyline run --panel https://panel.example.com --token YOUR_TOKEN --node-ids 1,2
 `, Version, core.Version())
 }

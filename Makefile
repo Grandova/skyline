@@ -28,7 +28,8 @@ clean:
 
 install: build
 	install -d /etc/skyline
-	install -m 0755 $(BINARY) /usr/local/bin/$(BINARY)
+	install -m 0755 $(BINARY) /etc/skyline/$(BINARY)
+	ln -sf /etc/skyline/$(BINARY) /usr/local/bin/$(BINARY)
 	@if [ ! -f /etc/skyline/config.yml ]; then \
 		install -m 0600 config.example.yml /etc/skyline/config.yml; \
 	fi

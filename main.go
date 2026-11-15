@@ -17,7 +17,7 @@ import (
 	"skyline/node"
 )
 
-const Version = "0.3.0"
+const Version = "0.3.1"
 
 func main() {
 	subcmd := "run"
@@ -53,26 +53,29 @@ func main() {
 	}
 
 	var (
-		configPath     string
-		panelURL       string
-		token          string
-		nodeID         int
-		nodeIDsStr     string
-		nodeType       string
-		machineID      int
-		apiVersion     string
-		listenIP       string
-		certFile       string
-		keyFile        string
-		logLevel       string
-		showVersion    bool
-		nonInteractive bool
+		configPath          string
+		panelURL            string
+		token               string
+		nodeID              int
+		nodeIDsStr          string
+		nodeType            string
+		machineID           int
+		apiVersion          string
+		listenIP            string
+		certFile            string
+		keyFile             string
+		proxyProtocol       string
+		acceptProxyProtocol bool
+		forwardAddress      string
+		logLevel            string
+		showVersion         bool
+		nonInteractive      bool
 	)
 
 	fs := flag.NewFlagSet(subcmd, flag.ExitOnError)
 	fs.Usage = printUsage
-	fs.StringVar(&configPath, "c", "", "Path to config file (YAML or JSON)")
-	fs.StringVar(&configPath, "config", "", "Path to config file (YAML or JSON)")
+	fs.StringVar(&configPath, "c", "", "Path to config file (default: /etc/skyline/config.yml)")
+	fs.StringVar(&configPath, "config", "", "Path to config file (default: /etc/skyline/config.yml)")
 	fs.StringVar(&panelURL, "panel", "", "Xboard panel URL (e.g. https://panel.example.com)")
 	fs.StringVar(&panelURL, "api-host", "", "Alias for --panel")
 	fs.StringVar(&token, "token", "", "Xboard server token or machine token")
@@ -85,6 +88,9 @@ func main() {
 	fs.StringVar(&listenIP, "listen-ip", "", "Override listen IP address")
 	fs.StringVar(&certFile, "cert-file", "", "TLS certificate PEM file path")
 	fs.StringVar(&keyFile, "key-file", "", "TLS private key PEM file path")
+	fs.StringVar(&proxyProtocol, "proxy-protocol", "", "Send Proxy Protocol header version: 0/off, 1/v1, or 2/v2")
+	fs.BoolVar(&acceptProxyProtocol, "accept-proxy-protocol", false, "Accept inbound Proxy Protocol v1 & v2 header")
+	fs.StringVar(&forwardAddress, "forward-address", "", "Optional outbound target address (host:port or IP)")
 	fs.StringVar(&logLevel, "log-level", "", "Log level (debug, info, warning, error, none)")
 	fs.BoolVar(&showVersion, "version", false, "Print version information and exit")
 	fs.BoolVar(&nonInteractive, "y", false, "Non-interactive mode for init")
@@ -98,7 +104,7 @@ func main() {
 	}
 
 	if subcmd == "init" {
-		if err := runInitCommand(configPath, panelURL, token, nodeIDsStr, nodeID, machineID, apiVersion, listenIP, logLevel, nonInteractive); err != nil {
+		if err := runInitCommand(configPath, panelURL, token, nodeIDsStr, nodeID, machineID, apiVersion, listenIP, proxyProtocol, acceptProxyProtocol, forwardAddress, logLevel, nonInteractive); err != nil {
 			log.Fatalf("[Skyline] %v", err)
 		}
 		return
@@ -106,12 +112,12 @@ func main() {
 
 	if configPath == "" {
 		for _, candidate := range []string{
-			"config.yml",
-			"config.yaml",
-			"config.json",
 			"/etc/skyline/config.yml",
 			"/etc/skyline/config.yaml",
 			"/etc/skyline/config.json",
+			"config.yml",
+			"config.yaml",
+			"config.json",
 		} {
 			if st, err := os.Stat(candidate); err == nil && !st.IsDir() {
 				configPath = candidate
@@ -120,9 +126,9 @@ func main() {
 		}
 	}
 
-	cfg, err := loadAndMergeConfig(configPath, panelURL, token, nodeID, nodeIDsStr, nodeType, machineID, apiVersion, listenIP, certFile, keyFile, logLevel)
+	cfg, err := loadAndMergeConfig(configPath, panelURL, token, nodeID, nodeIDsStr, nodeType, machineID, apiVersion, listenIP, certFile, keyFile, proxyProtocol, acceptProxyProtocol, forwardAddress, logLevel)
 	if err != nil {
-		log.Fatalf("[Skyline] %v\n提示: 可运行 `skyline init` 向导生成配置文件，或运行 `skyline help` 查看参数说明。", err)
+		log.Fatalf("[Skyline] %v\n提示: 可运行 `skyline init` 向导生成配置文件 (/etc/skyline/config.yml)，或运行 `skyline help` 查看参数说明。", err)
 	}
 
 	switch subcmd {
@@ -154,7 +160,7 @@ func main() {
 		sig := <-sigCh
 		if sig == syscall.SIGHUP {
 			logger.Printf("Received SIGHUP, reloading configuration from %s...", configPath)
-			newCfg, err := loadAndMergeConfig(configPath, panelURL, token, nodeID, nodeIDsStr, nodeType, machineID, apiVersion, listenIP, certFile, keyFile, logLevel)
+			newCfg, err := loadAndMergeConfig(configPath, panelURL, token, nodeID, nodeIDsStr, nodeType, machineID, apiVersion, listenIP, certFile, keyFile, proxyProtocol, acceptProxyProtocol, forwardAddress, logLevel)
 			if err != nil {
 				logger.Printf("Configuration reload rejected: %v", err)
 				continue
@@ -184,7 +190,9 @@ func loadAndMergeConfig(
 	nodeID int,
 	nodeIDsStr, nodeType string,
 	machineID int,
-	apiVersion, listenIP, certFile, keyFile, logLevel string,
+	apiVersion, listenIP, certFile, keyFile, proxyProtocol string,
+	acceptProxyProtocol bool,
+	forwardAddress, logLevel string,
 ) (*config.Config, error) {
 	cfg, err := config.Load(configPath)
 	if err != nil {
@@ -230,6 +238,20 @@ func loadAndMergeConfig(
 	}
 	if keyFile != "" {
 		cfg.KeyFile = keyFile
+	}
+	if proxyProtocol != "" {
+		ver, err := config.ParseProxyProtocol(proxyProtocol)
+		if err != nil {
+			return nil, err
+		}
+		cfg.ProxyProtocol = ver
+	}
+	if acceptProxyProtocol {
+		v := true
+		cfg.AcceptProxyProtocol = &v
+	}
+	if forwardAddress != "" {
+		cfg.ForwardAddress = forwardAddress
 	}
 	if logLevel != "" {
 		cfg.LogLevel = logLevel

@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	gotls "crypto/tls"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -46,8 +47,11 @@ type ExtendedTransportSettings struct {
 	FakeTitle              string            `json:"fakeTitle,omitempty"`
 	FakeMessage            string            `json:"fakeMessage,omitempty"`
 	AcceptProxyProtocol    bool              `json:"acceptProxyProtocol,omitempty"`
+	ProxyProtocol          int               `json:"proxyProtocol,omitempty"`
 	UseTLSCertificate      bool              `json:"useTLSCertificate,omitempty"`
 	CIDRSegments           []string          `json:"cidrSegments,omitempty"`
+	MaxEarlyData           int32             `json:"maxEarlyData,omitempty"`
+	EarlyDataHeaderName    string            `json:"earlyDataHeaderName,omitempty"`
 }
 
 // EncodeTransportSettings wraps ExtendedTransportSettings in a protobuf StringValue Any message.
@@ -130,7 +134,9 @@ func evaluateFastAuth(ctx context.Context, r *http.Request, respHeader http.Head
 		return nil, "", nil, v2net.Destination{}
 	}
 	respHeader.Set(mx.FastAuthResponseHeader, mx.FastAuthStatusOK)
-	return &mx.FastAuthResult{Status: mx.FastAuthStatusOK}, strings.TrimSpace(payload.AuthData), inbound.User, inbound.Target
+	user, _ := inbound.User.(*protocol.MemoryUser)
+	target, _ := inbound.Target.(v2net.Destination)
+	return &mx.FastAuthResult{Status: mx.FastAuthStatusOK}, strings.TrimSpace(payload.AuthData), user, target
 }
 
 func wrapFastAuthConn(base v2net.Conn, result *mx.FastAuthResult, token string, user *protocol.MemoryUser, target v2net.Destination) internet.Connection {
@@ -237,6 +243,7 @@ func createHTTPBasedListener(ctx context.Context, address v2net.Address, port v2
 	if err != nil {
 		return nil, err
 	}
+	rawListener = WrapProxyProtocolListener(rawListener, streamSettings.SocketSettings.AcceptProxyProtocol)
 
 	if tlsCfg := v2tls.ConfigFromStreamSettings(streamSettings); tlsCfg != nil {
 		if stdTLS := tlsCfg.GetTLSConfig(); stdTLS != nil {
@@ -253,7 +260,7 @@ func createHTTPBasedListener(ctx context.Context, address v2net.Address, port v2
 	}
 
 	hl.server = &http.Server{
-		Handler:            http.HandlerFunc(hl.serveHTTP),
+		Handler:           http.HandlerFunc(hl.serveHTTP),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
@@ -275,6 +282,30 @@ func (l *httpStreamListener) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	// 1. Check if client is requesting a WebSocket upgrade (used by mc1 or ws-compatible clients)
 	if strings.EqualFold(r.Header.Get("Upgrade"), "websocket") {
 		respHeader := http.Header{}
+		var earlyData []byte
+		if l.cfg.MaxEarlyData > 0 {
+			if l.cfg.EarlyDataHeaderName != "" {
+				if ed := r.Header.Get(l.cfg.EarlyDataHeaderName); ed != "" {
+					earlyData, _ = base64.RawURLEncoding.DecodeString(ed)
+				}
+			} else if wsap := r.Header.Values("Sec-WebSocket-Protocol"); len(wsap) > 0 {
+				rawED := strings.TrimSpace(strings.Split(wsap[0], ",")[0])
+				if rawED != "" {
+					if decoded, err := base64.RawURLEncoding.DecodeString(rawED); err == nil {
+						earlyData = decoded
+						respHeader.Set("Sec-WebSocket-Protocol", rawED)
+					}
+				}
+			}
+		} else if expectedPath != "/" && strings.HasPrefix(reqPath, expectedPath+"/") {
+			suffix := strings.TrimPrefix(reqPath, expectedPath+"/")
+			if suffix != "" {
+				if decoded, err := base64.RawURLEncoding.DecodeString(suffix); err == nil {
+					earlyData = decoded
+				}
+			}
+		}
+
 		faRes, faToken, faUser, faTarget := evaluateFastAuth(l.ctx, r, respHeader)
 		wsConn, err := wsUpgrader.Upgrade(w, r, respHeader)
 		if err != nil {
@@ -282,6 +313,9 @@ func (l *httpStreamListener) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		remoteAddr := parseRemoteAddr(r, wsConn.RemoteAddr())
 		baseConn := newWSStreamConn(wsConn, remoteAddr)
+		if len(earlyData) > 0 {
+			baseConn.reader = bytes.NewReader(earlyData)
+		}
 		l.addConn(wrapFastAuthConn(baseConn, faRes, faToken, faUser, faTarget))
 		return
 	}
@@ -465,6 +499,7 @@ func listenMundoRDPTransport(ctx context.Context, address v2net.Address, port v2
 	if err != nil {
 		return nil, err
 	}
+	rawListener = WrapProxyProtocolListener(rawListener, streamSettings.SocketSettings.AcceptProxyProtocol)
 
 	var stdTLS *gotls.Config
 	if tlsCfg := v2tls.ConfigFromStreamSettings(streamSettings); tlsCfg != nil {
@@ -630,7 +665,17 @@ func dialWSTransport(ctx context.Context, dest v2net.Destination, streamSettings
 	scheme := "ws"
 	wsDialer := &websocket.Dialer{
 		NetDialContext: func(dCtx context.Context, network, addr string) (v2net.Conn, error) {
-			return internet.DialSystem(dCtx, dest, streamSettings.SocketSettings)
+			raw, err := internet.DialSystem(dCtx, dest, streamSettings.SocketSettings)
+			if err != nil {
+				return nil, err
+			}
+			if cfg.ProxyProtocol == 1 || cfg.ProxyProtocol == 2 {
+				if err := WriteProxyProtocolHeader(raw, cfg.ProxyProtocol, raw.LocalAddr(), raw.RemoteAddr()); err != nil {
+					_ = raw.Close()
+					return nil, err
+				}
+			}
+			return raw, nil
 		},
 		ReadBufferSize:   8 * 1024,
 		WriteBufferSize:  8 * 1024,
@@ -642,6 +687,12 @@ func dialWSTransport(ctx context.Context, dest v2net.Destination, streamSettings
 			raw, err := internet.DialSystem(dCtx, dest, streamSettings.SocketSettings)
 			if err != nil {
 				return nil, err
+			}
+			if cfg.ProxyProtocol == 1 || cfg.ProxyProtocol == 2 {
+				if err := WriteProxyProtocolHeader(raw, cfg.ProxyProtocol, raw.LocalAddr(), raw.RemoteAddr()); err != nil {
+					_ = raw.Close()
+					return nil, err
+				}
 			}
 			stdTLS := tlsCfg.GetTLSConfig(v2tls.WithDestination(dest), v2tls.WithNextProto("http/1.1"))
 			tlsConn := gotls.Client(raw, stdTLS)
@@ -699,6 +750,12 @@ func dialHTTPUpgrade(ctx context.Context, dest v2net.Destination, streamSettings
 	rawConn, err := internet.DialSystem(ctx, dest, streamSettings.SocketSettings)
 	if err != nil {
 		return nil, err
+	}
+	if cfg.ProxyProtocol == 1 || cfg.ProxyProtocol == 2 {
+		if err := WriteProxyProtocolHeader(rawConn, cfg.ProxyProtocol, rawConn.LocalAddr(), rawConn.RemoteAddr()); err != nil {
+			_ = rawConn.Close()
+			return nil, err
+		}
 	}
 	if tlsCfg := v2tls.ConfigFromStreamSettings(streamSettings); tlsCfg != nil {
 		stdTLS := tlsCfg.GetTLSConfig(v2tls.WithDestination(dest), v2tls.WithNextProto("http/1.1"))
@@ -768,6 +825,12 @@ func dialMundoRDPTransport(ctx context.Context, dest v2net.Destination, streamSe
 	rawConn, err := internet.DialSystem(ctx, dest, streamSettings.SocketSettings)
 	if err != nil {
 		return nil, err
+	}
+	if cfg.ProxyProtocol == 1 || cfg.ProxyProtocol == 2 {
+		if err := WriteProxyProtocolHeader(rawConn, cfg.ProxyProtocol, rawConn.LocalAddr(), rawConn.RemoteAddr()); err != nil {
+			_ = rawConn.Close()
+			return nil, err
+		}
 	}
 
 	username := strings.TrimSpace(cfg.Username)

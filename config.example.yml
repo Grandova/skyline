@@ -1,0 +1,26 @@
+# Skyline MX 协议后端配置文件示例 (YAML)
+log_level: info
+
+# 单节点模式配置（若配置了 nodes 列表，以下字段作为各节点的默认值）
+panel_url: https://your-xboard-panel.example.com
+token: your-xboard-server-token
+node_id: 1
+node_type: mx
+api_version: v1          # 可选: v1 (/api/v1/server/UniProxy/*), v2 (/api/v2/server/*), auto
+# machine_id: 0          # 可选: Xboard V2 机器 ID（仅配置 machine_id 时将自动拉取机器下所有 mx 节点）
+# listen_ip: 0.0.0.0     # 可选: 覆盖面板下发的监听 IP
+# cert_file: /path/to/fullchain.pem  # 可选: TLS 证书文件路径（未提供时将自动按 SNI/Host 签发内存证书）
+# key_file: /path/to/privkey.pem     # 可选: TLS 私钥文件路径
+http_timeout: 15s
+device_ttl: 90s
+
+# 多节点模式配置示例（如需单进程同时对接多个 MX 节点，可取消下方注释）
+# nodes:
+#   - node_id: 1
+#     node_type: mx
+#     panel_url: https://your-xboard-panel.example.com
+#     token: your-xboard-server-token
+#   - node_id: 2
+#     node_type: mx
+#     cert_file: /etc/skyline/node2.crt
+#     key_file: /etc/skyline/node2.key

@@ -1,0 +1,243 @@
+package main
+
+import (
+	"context"
+	"flag"
+	"fmt"
+	"log"
+	"os"
+	"os/signal"
+	"runtime"
+	"strings"
+	"syscall"
+
+	core "github.com/v2fly/v2ray-core/v5"
+
+	"skyline/config"
+	"skyline/node"
+)
+
+const Version = "0.3.0"
+
+func main() {
+	subcmd := "run"
+	args := os.Args[1:]
+	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
+		subcmd = strings.ToLower(strings.TrimSpace(args[0]))
+		args = args[1:]
+	}
+
+	switch subcmd {
+	case "version", "-v", "--version":
+		fmt.Printf("Skyline MX Backend v%s (M-core %s, %s/%s, %s)\n",
+			Version, core.Version(), runtime.GOOS, runtime.GOARCH, runtime.Version())
+		return
+	case "help", "-h", "--help":
+		printUsage()
+		return
+	case "service", "svc":
+		action := "status"
+		if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
+			action = args[0]
+			args = args[1:]
+		}
+		fs := flag.NewFlagSet("service", flag.ExitOnError)
+		var cfgPath string
+		fs.StringVar(&cfgPath, "c", "", "Path to config file")
+		fs.StringVar(&cfgPath, "config", "", "Path to config file")
+		_ = fs.Parse(args)
+		if err := runServiceCommand(action, cfgPath); err != nil {
+			log.Fatalf("[Skyline] %v", err)
+		}
+		return
+	}
+
+	var (
+		configPath     string
+		panelURL       string
+		token          string
+		nodeID         int
+		nodeIDsStr     string
+		nodeType       string
+		machineID      int
+		apiVersion     string
+		listenIP       string
+		certFile       string
+		keyFile        string
+		logLevel       string
+		showVersion    bool
+		nonInteractive bool
+	)
+
+	fs := flag.NewFlagSet(subcmd, flag.ExitOnError)
+	fs.Usage = printUsage
+	fs.StringVar(&configPath, "c", "", "Path to config file (YAML or JSON)")
+	fs.StringVar(&configPath, "config", "", "Path to config file (YAML or JSON)")
+	fs.StringVar(&panelURL, "panel", "", "Xboard panel URL (e.g. https://panel.example.com)")
+	fs.StringVar(&panelURL, "api-host", "", "Alias for --panel")
+	fs.StringVar(&token, "token", "", "Xboard server token or machine token")
+	fs.StringVar(&token, "api-key", "", "Alias for --token")
+	fs.IntVar(&nodeID, "node-id", 0, "Xboard MX node ID")
+	fs.StringVar(&nodeIDsStr, "node-ids", "", "Comma-separated Xboard MX node IDs (e.g. 1,2,3)")
+	fs.StringVar(&nodeType, "node-type", "mx", "Node protocol type (default: mx)")
+	fs.IntVar(&machineID, "machine-id", 0, "Xboard V2 machine ID (optional)")
+	fs.StringVar(&apiVersion, "api-version", "", "Panel API version: v1, v2, or auto (default: v1)")
+	fs.StringVar(&listenIP, "listen-ip", "", "Override listen IP address")
+	fs.StringVar(&certFile, "cert-file", "", "TLS certificate PEM file path")
+	fs.StringVar(&keyFile, "key-file", "", "TLS private key PEM file path")
+	fs.StringVar(&logLevel, "log-level", "", "Log level (debug, info, warning, error, none)")
+	fs.BoolVar(&showVersion, "version", false, "Print version information and exit")
+	fs.BoolVar(&nonInteractive, "y", false, "Non-interactive mode for init")
+	fs.BoolVar(&nonInteractive, "yes", false, "Non-interactive mode for init")
+	_ = fs.Parse(args)
+
+	if showVersion {
+		fmt.Printf("Skyline MX Backend v%s (M-core %s, %s/%s, %s)\n",
+			Version, core.Version(), runtime.GOOS, runtime.GOARCH, runtime.Version())
+		return
+	}
+
+	if subcmd == "init" {
+		if err := runInitCommand(configPath, panelURL, token, nodeIDsStr, nodeID, machineID, apiVersion, listenIP, logLevel, nonInteractive); err != nil {
+			log.Fatalf("[Skyline] %v", err)
+		}
+		return
+	}
+
+	if configPath == "" {
+		for _, candidate := range []string{
+			"config.yml",
+			"config.yaml",
+			"config.json",
+			"/etc/skyline/config.yml",
+			"/etc/skyline/config.yaml",
+			"/etc/skyline/config.json",
+		} {
+			if st, err := os.Stat(candidate); err == nil && !st.IsDir() {
+				configPath = candidate
+				break
+			}
+		}
+	}
+
+	cfg, err := loadAndMergeConfig(configPath, panelURL, token, nodeID, nodeIDsStr, nodeType, machineID, apiVersion, listenIP, certFile, keyFile, logLevel)
+	if err != nil {
+		log.Fatalf("[Skyline] %v\n提示: 可运行 `skyline init` 向导生成配置文件，或运行 `skyline help` 查看参数说明。", err)
+	}
+
+	switch subcmd {
+	case "check", "doctor", "test":
+		if err := runCheckCommand(cfg); err != nil {
+			os.Exit(1)
+		}
+		return
+	case "run", "start":
+		// Proceed to daemon startup below
+	default:
+		log.Fatalf("[Skyline] 未知命令 %q，请运行 `skyline help` 查看支持的命令。", subcmd)
+	}
+
+	logger := log.New(os.Stdout, "[Skyline] ", log.LstdFlags)
+	logger.Printf("Starting Skyline MX Backend v%s (M-core %s)", Version, core.Version())
+
+	mgr := node.NewManager(cfg, logger)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	if err := mgr.Start(ctx); err != nil {
+		log.Fatalf("[Skyline] Failed to start node manager: %v", err)
+	}
+
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
+	for {
+		sig := <-sigCh
+		if sig == syscall.SIGHUP {
+			logger.Printf("Received SIGHUP, reloading configuration from %s...", configPath)
+			newCfg, err := loadAndMergeConfig(configPath, panelURL, token, nodeID, nodeIDsStr, nodeType, machineID, apiVersion, listenIP, certFile, keyFile, logLevel)
+			if err != nil {
+				logger.Printf("Configuration reload rejected: %v", err)
+				continue
+			}
+			_ = mgr.Stop()
+			mgr = node.NewManager(newCfg, logger)
+			if err := mgr.Start(ctx); err != nil {
+				logger.Printf("Failed to restart manager after reload: %v", err)
+			} else {
+				logger.Printf("Configuration reloaded successfully.")
+			}
+			continue
+		}
+
+		logger.Printf("Received signal %v, shutting down gracefully...", sig)
+		break
+	}
+
+	if err := mgr.Stop(); err != nil {
+		logger.Printf("Shutdown error: %v", err)
+	}
+	logger.Printf("Skyline stopped.")
+}
+
+func loadAndMergeConfig(
+	configPath, panelURL, token string,
+	nodeID int,
+	nodeIDsStr, nodeType string,
+	machineID int,
+	apiVersion, listenIP, certFile, keyFile, logLevel string,
+) (*config.Config, error) {
+	cfg, err := config.Load(configPath)
+	if err != nil {
+		return nil, fmt.Errorf("加载配置文件失败: %w", err)
+	}
+
+	if panelURL != "" {
+		cfg.PanelURL = panelURL
+	}
+	if token != "" {
+		cfg.Token = token
+	}
+	if nodeID > 0 {
+		cfg.NodeID = nodeID
+	}
+	if nodeIDsStr != "" {
+		ids, err := parseNodeIDList(nodeIDsStr)
+		if err != nil {
+			return nil, err
+		}
+		cfg.Nodes = nil
+		for _, id := range ids {
+			cfg.Nodes = append(cfg.Nodes, config.NodeTargetConfig{
+				NodeID:   id,
+				NodeType: nodeType,
+			})
+		}
+	}
+	if nodeType != "" {
+		cfg.NodeType = nodeType
+	}
+	if machineID > 0 {
+		cfg.MachineID = machineID
+	}
+	if apiVersion != "" {
+		cfg.APIVersion = apiVersion
+	}
+	if listenIP != "" {
+		cfg.ListenIP = listenIP
+	}
+	if certFile != "" {
+		cfg.CertFile = certFile
+	}
+	if keyFile != "" {
+		cfg.KeyFile = keyFile
+	}
+	if logLevel != "" {
+		cfg.LogLevel = logLevel
+	}
+
+	cfg.Normalize()
+	if err := cfg.Validate(); err != nil {
+		return nil, fmt.Errorf("配置校验未通过: %w", err)
+	}
+	return cfg, nil
+}

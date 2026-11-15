@@ -1,0 +1,16 @@
+# Local runtime configurations with secrets
+config.yml
+config.yaml
+config.json
+
+# Build artifacts & OS-specific files
+dist/
+*.exe
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+.DS_Store
+
+

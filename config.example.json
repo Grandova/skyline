@@ -1,0 +1,18 @@
+{
+  "log_level": "info",
+  "panel_url": "https://your-xboard-panel.example.com",
+  "token": "your-xboard-server-token",
+  "node_id": 1,
+  "node_type": "mx",
+  "api_version": "v1",
+  "http_timeout": "15s",
+  "device_ttl": "90s",
+  "nodes": [
+    {
+      "node_id": 1,
+      "node_type": "mx",
+      "panel_url": "https://your-xboard-panel.example.com",
+      "token": "your-xboard-server-token"
+    }
+  ]
+}

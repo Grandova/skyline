@@ -1,0 +1,21 @@
+[Unit]
+Description=Skyline MX Protocol Backend for Xboard
+Documentation=https://github.com/Grandova/skyline
+After=network.target network-online.target nss-lookup.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/etc/skyline
+ExecStart=/usr/local/bin/skyline run -c /etc/skyline/config.yml
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=5s
+LimitNOFILE=1048576
+LimitNPROC=65535
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

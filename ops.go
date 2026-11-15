@@ -1,24 +1,52 @@
 package main
 
 import (
+	"archive/zip"
 	"bufio"
+	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/base64"
+	"encoding/hex"
+	"flag"
 	"fmt"
 	"io"
 	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
 	"time"
+
+	"golang.org/x/crypto/curve25519"
 
 	core "github.com/v2fly/v2ray-core/v5"
 
 	"skyline/config"
 	"skyline/panel"
 	"skyline/transportext"
+)
+
+const (
+	githubRepo       = "Grandova/skyline"
+	githubReleaseURL = "https://github.com/Grandova/skyline/releases/latest/download"
+	defaultDir       = "/etc/skyline"
+	defaultBinPath   = "/etc/skyline/skyline"
+	defaultCfgPath   = "/etc/skyline/config.yml"
+	symlinkBinPath   = "/usr/local/bin/skyline"
+	usrBinPath       = "/usr/bin/skyline"
+	systemdUnitPath  = "/etc/systemd/system/skyline.service"
+
+	ansiReset  = "\033[0m"
+	ansiRed    = "\033[0;31m"
+	ansiGreen  = "\033[0;32m"
+	ansiYellow = "\033[1;33m"
+	ansiCyan   = "\033[0;36m"
+	ansiBold   = "\033[1m"
 )
 
 func parseNodeIDList(raw string) ([]int, error) {
@@ -62,7 +90,579 @@ func promptLine(reader *bufio.Reader, label, defaultVal string) string {
 	return line
 }
 
-// runInitCommand generates a Skyline YAML config interactively or via CLI flags.
+// ============================================================================
+// Interactive Terminal Management Panel (`skyline` / `skyline menu`)
+// ============================================================================
+
+func runManageMenu(cfgPath string) error {
+	if cfgPath == "" {
+		cfgPath = resolveDefaultConfigPath("")
+	}
+	reader := bufio.NewReader(os.Stdin)
+
+	for {
+		printDashboardHeader(cfgPath)
+		fmt.Printf("  %s[服务控制]%s\n", ansiBold, ansiReset)
+		fmt.Printf("    %s1.%s 启动服务 (start)              %s2.%s 停止服务 (stop)\n", ansiGreen, ansiReset, ansiGreen, ansiReset)
+		fmt.Printf("    %s3.%s 重启服务 (restart)            %s4.%s 平滑热重载配置 (reload)\n", ansiGreen, ansiReset, ansiGreen, ansiReset)
+		fmt.Printf("    %s5.%s 查看运行状态 (status)         %s6.%s 实时查看运行日志 (log)\n\n", ansiGreen, ansiReset, ansiGreen, ansiReset)
+
+		fmt.Printf("  %s[配置与协议头管理 (/etc/skyline/config.yml)]%s\n", ansiBold, ansiReset)
+		fmt.Printf("    %s7.%s 配置向导: 生成/修改面板与节点对接 (skyline init)\n", ansiGreen, ansiReset)
+		fmt.Printf("    %s8.%s 直接编辑配置文件 (%s)\n", ansiGreen, ansiReset, cfgPath)
+		fmt.Printf("    %s9.%s 快捷设置 Proxy Protocol v1/v2 协议头 (发送 / 接收 / 转发地址)\n", ansiGreen, ansiReset)
+		fmt.Printf("   %s10.%s 查看当前完整配置文件内容\n\n", ansiGreen, ansiReset)
+
+		fmt.Printf("  %s[诊断与工具箱]%s\n", ansiBold, ansiReset)
+		fmt.Printf("   %s11.%s 节点连通性与配置自检诊断 (skyline check)\n", ansiGreen, ansiReset)
+		fmt.Printf("   %s12.%s 生成 REALITY X25519 密钥对与 ShortID (skyline reality)\n", ansiGreen, ansiReset)
+		fmt.Printf("   %s13.%s 下载 / 部署 Xboard MxProtocol 插件包 (skyline plugin)\n\n", ansiGreen, ansiReset)
+
+		fmt.Printf("  %s[系统与维护]%s\n", ansiBold, ansiReset)
+		fmt.Printf("   %s14.%s 安装 / 重置 systemd 开机自启服务 (skyline install)\n", ansiGreen, ansiReset)
+		fmt.Printf("   %s15.%s 在线更新 Skyline 到最新版本 (skyline update)\n", ansiGreen, ansiReset)
+		fmt.Printf("   %s16.%s 卸载 Skyline 服务与程序 (skyline uninstall)\n", ansiGreen, ansiReset)
+		fmt.Printf("    %s0.%s 退出管理面板\n", ansiGreen, ansiReset)
+		fmt.Printf("%s====================================================================%s\n", ansiCyan, ansiReset)
+		fmt.Print("请输入操作编号 [0-16]: ")
+
+		choice, err := reader.ReadString('\n')
+		if err != nil {
+			fmt.Println()
+			return nil
+		}
+		choice = strings.TrimSpace(choice)
+		fmt.Println()
+
+		switch choice {
+		case "1":
+			_ = runServiceCommand("start", cfgPath)
+		case "2":
+			_ = runServiceCommand("stop", cfgPath)
+		case "3":
+			_ = runServiceCommand("restart", cfgPath)
+		case "4":
+			_ = runServiceCommand("reload", cfgPath)
+		case "5":
+			_ = runServiceCommand("status", cfgPath)
+		case "6":
+			fmt.Println("正在打开实时日志 (按 Ctrl+C 退出日志查看)...")
+			_ = runServiceCommand("log", cfgPath)
+		case "7":
+			if err := runInitCommand(cfgPath, "", "", "", 0, 0, "", "", "", false, "", "", false); err != nil {
+				fmt.Printf("%s[ERROR]%s %v\n", ansiRed, ansiReset, err)
+			} else if isServiceActive() {
+				ans := promptLine(reader, "是否立即重启 Skyline 服务以应用新配置？(Y/n)", "Y")
+				if strings.EqualFold(ans, "y") || strings.EqualFold(ans, "yes") {
+					_ = runServiceCommand("restart", cfgPath)
+				}
+			}
+		case "8":
+			if err := runEditConfigCommand(cfgPath); err != nil {
+				fmt.Printf("%s[ERROR]%s %v\n", ansiRed, ansiReset, err)
+			}
+		case "9":
+			if err := runInteractiveProxyProtocolSetup(reader, cfgPath); err != nil {
+				fmt.Printf("%s[ERROR]%s %v\n", ansiRed, ansiReset, err)
+			}
+		case "10":
+			raw, rErr := os.ReadFile(cfgPath)
+			if rErr != nil {
+				fmt.Printf("%s[WARN]%s 读取配置文件 %s 失败: %v\n", ansiYellow, ansiReset, cfgPath, rErr)
+			} else {
+				fmt.Printf("--- %s ---\n%s\n-------------------\n", cfgPath, string(raw))
+			}
+		case "11":
+			cfg, cErr := config.Load(cfgPath)
+			if cErr != nil {
+				fmt.Printf("%s[ERROR]%s 加载配置文件 %s 失败: %v\n", ansiRed, ansiReset, cfgPath, cErr)
+			} else if vErr := cfg.Validate(); vErr != nil {
+				fmt.Printf("%s[ERROR]%s 配置校验失败: %v\n", ansiRed, ansiReset, vErr)
+			} else {
+				_ = runCheckCommand(cfg)
+			}
+		case "12":
+			_ = runRealityKeygenCommand()
+		case "13":
+			targetDir := promptLine(reader, "请输入 Xboard 插件解压目录 (例如 /www/wwwroot/xboard/plugins 或留空解压到当前目录)", ".")
+			if err := runPluginDownloadCommand(targetDir); err != nil {
+				fmt.Printf("%s[ERROR]%s %v\n", ansiRed, ansiReset, err)
+			}
+		case "14":
+			if err := runServiceCommand("install", cfgPath); err != nil {
+				fmt.Printf("%s[ERROR]%s %v\n", ansiRed, ansiReset, err)
+			}
+		case "15":
+			if err := runSelfUpdateCommand(); err != nil {
+				fmt.Printf("%s[ERROR]%s %v\n", ansiRed, ansiReset, err)
+			}
+		case "16":
+			confirm := promptLine(reader, "确认要卸载 Skyline 服务吗？(y/N)", "N")
+			if strings.EqualFold(confirm, "y") || strings.EqualFold(confirm, "yes") {
+				_ = runServiceCommand("uninstall", cfgPath)
+			}
+		case "0", "q", "quit", "exit":
+			return nil
+		default:
+			fmt.Printf("%s[WARN]%s 无效的选项 %q，请输入 0-16 之间的数字。\n", ansiYellow, ansiReset, choice)
+		}
+
+		fmt.Printf("\n%s按回车键返回 Skyline 管理主菜单...%s", ansiCyan, ansiReset)
+		_, _ = reader.ReadString('\n')
+	}
+}
+
+func printDashboardHeader(cfgPath string) {
+	fmt.Print("\033[H\033[2J")
+	fmt.Printf("%s====================================================================%s\n", ansiCyan, ansiReset)
+	fmt.Printf("%s         Skyline MX 协议后端 - 终端交互式管理面板 v%s           %s\n", ansiCyan, Version, ansiReset)
+	fmt.Printf("%s====================================================================%s\n", ansiCyan, ansiReset)
+
+	binStatus := fmt.Sprintf("%s未安装%s", ansiYellow, ansiReset)
+	if st, err := os.Stat(defaultBinPath); err == nil && !st.IsDir() {
+		binStatus = fmt.Sprintf("%s%s%s", ansiGreen, defaultBinPath, ansiReset)
+	} else if exe, err := os.Executable(); err == nil {
+		binStatus = exe
+	}
+
+	svcStatus := fmt.Sprintf("%s● 未运行 (inactive)%s", ansiYellow, ansiReset)
+	if isServiceActive() {
+		svcStatus = fmt.Sprintf("%s● 运行中 (active)%s", ansiGreen, ansiReset)
+	}
+	autoStatus := fmt.Sprintf("%s未启用%s", ansiYellow, ansiReset)
+	if isServiceEnabled() {
+		autoStatus = fmt.Sprintf("%s已启用 (enabled)%s", ansiGreen, ansiReset)
+	}
+
+	fmt.Printf("  程序路径 : %s (内核: M-core %s)\n", binStatus, core.Version())
+	fmt.Printf("  服务状态 : %s | 开机自启: %s\n", svcStatus, autoStatus)
+
+	if cfg, err := config.Load(cfgPath); err == nil {
+		var nodeDesc string
+		if cfg.MachineID > 0 && len(cfg.Nodes) == 0 {
+			nodeDesc = fmt.Sprintf("机器发现模式 (Machine #%d)", cfg.MachineID)
+		} else if len(cfg.Nodes) > 0 {
+			ids := make([]string, 0, len(cfg.Nodes))
+			for _, n := range cfg.Nodes {
+				ids = append(ids, fmt.Sprintf("#%d", n.NodeID))
+			}
+			nodeDesc = strings.Join(ids, ", ")
+		} else {
+			nodeDesc = "未配置节点"
+		}
+		acceptPP := false
+		if cfg.AcceptProxyProtocol != nil && *cfg.AcceptProxyProtocol {
+			acceptPP = true
+		}
+		ppSend := transportext.FormatProxyProtocolVersion(cfg.ProxyProtocol.Int())
+		fmt.Printf("  配置文件 : %s%s%s\n", ansiGreen, cfgPath, ansiReset)
+		fmt.Printf("  对接面板 : %s (API: %s | 节点: %s)\n", cfg.PanelURL, cfg.APIVersion, nodeDesc)
+		fmt.Printf("  协议头   : 发送 Proxy Protocol = %s%s%s | 接收 Proxy Protocol = %s%v%s\n",
+			ansiCyan, ppSend, ansiReset, ansiCyan, acceptPP, ansiReset)
+	} else {
+		fmt.Printf("  配置文件 : %s%s (尚未生成，请按 7 运行配置向导)%s\n", ansiYellow, cfgPath, ansiReset)
+	}
+	fmt.Printf("%s--------------------------------------------------------------------%s\n", ansiCyan, ansiReset)
+}
+
+func isServiceActive() bool {
+	if runtime.GOOS != "linux" {
+		return false
+	}
+	err := exec.Command("systemctl", "is-active", "--quiet", "skyline").Run()
+	return err == nil
+}
+
+func isServiceEnabled() bool {
+	if runtime.GOOS != "linux" {
+		return false
+	}
+	err := exec.Command("systemctl", "is-enabled", "--quiet", "skyline").Run()
+	return err == nil
+}
+
+// ============================================================================
+// Direct Config Editing & Quick Proxy Protocol v1/v2 Switcher
+// ============================================================================
+
+func runEditConfigCommand(cfgPath string) error {
+	if cfgPath == "" {
+		cfgPath = defaultCfgPath
+	}
+	if _, err := os.Stat(cfgPath); os.IsNotExist(err) {
+		fmt.Printf("[INFO] 配置文件 %s 尚不存在，正在启动初始化向导...\n", cfgPath)
+		return runInitCommand(cfgPath, "", "", "", 0, 0, "", "", "", false, "", "", false)
+	}
+
+	editor := os.Getenv("EDITOR")
+	if editor == "" {
+		for _, candidate := range []string{"nano", "vim", "vi"} {
+			if _, err := exec.LookPath(candidate); err == nil {
+				editor = candidate
+				break
+			}
+		}
+	}
+	if editor == "" {
+		return fmt.Errorf("未找到可用的文本编辑器 (nano / vim / vi)，请直接修改 %s", cfgPath)
+	}
+
+	cmd := exec.Command(editor, cfgPath)
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("编辑器退出异常: %w", err)
+	}
+
+	cfg, err := config.Load(cfgPath)
+	if err != nil {
+		return fmt.Errorf("配置文件语法校验失败，请检查格式: %w", err)
+	}
+	if err := cfg.Validate(); err != nil {
+		return fmt.Errorf("配置文件内容校验未通过: %w", err)
+	}
+	fmt.Printf("%s[OK]%s 配置文件 %s 语法与参数校验通过！\n", ansiGreen, ansiReset, cfgPath)
+
+	if isServiceActive() {
+		reader := bufio.NewReader(os.Stdin)
+		ans := promptLine(reader, "是否立即热重载/重启 Skyline 服务以应用修改？(Y/n)", "Y")
+		if strings.EqualFold(ans, "y") || strings.EqualFold(ans, "yes") {
+			return runServiceCommand("restart", cfgPath)
+		}
+	}
+	return nil
+}
+
+func runProxyProtocolCLI(args []string) error {
+	fs := flag.NewFlagSet("pp", flag.ContinueOnError)
+	var (
+		cfgPath     string
+		sendVerStr  string
+		acceptStr   string
+		forwardAddr string
+	)
+	fs.StringVar(&cfgPath, "c", "", "配置文件路径")
+	fs.StringVar(&cfgPath, "config", "", "配置文件路径")
+	fs.StringVar(&sendVerStr, "send", "", "发送 Proxy Protocol 版本: 0/off, 1/v1, 2/v2")
+	fs.StringVar(&acceptStr, "accept", "", "接收并解析入站 Proxy Protocol v1/v2: true 或 false")
+	fs.StringVar(&forwardAddr, "forward", "", "固定出站转发目标地址 (如 127.0.0.1:8443)")
+	_ = fs.Parse(args)
+
+	cfgPath = resolveDefaultConfigPath(cfgPath)
+	if sendVerStr == "" && acceptStr == "" && forwardAddr == "" {
+		return runInteractiveProxyProtocolSetup(bufio.NewReader(os.Stdin), cfgPath)
+	}
+
+	cfg, err := config.Load(cfgPath)
+	if err != nil {
+		return fmt.Errorf("加载配置文件 %s 失败: %w", cfgPath, err)
+	}
+	sendVer := cfg.ProxyProtocol
+	if sendVerStr != "" {
+		v, pErr := config.ParseProxyProtocol(sendVerStr)
+		if pErr != nil {
+			return pErr
+		}
+		sendVer = v
+	}
+	acceptPP := false
+	if cfg.AcceptProxyProtocol != nil {
+		acceptPP = *cfg.AcceptProxyProtocol
+	}
+	if acceptStr != "" {
+		acceptPP = strings.EqualFold(acceptStr, "true") || acceptStr == "1" || strings.EqualFold(acceptStr, "yes") || strings.EqualFold(acceptStr, "on")
+	}
+	fw := cfg.ForwardAddress
+	if forwardAddr != "" {
+		if forwardAddr == "off" || forwardAddr == "none" {
+			fw = ""
+		} else {
+			fw = forwardAddr
+		}
+	}
+
+	if err := applyProxyProtocolToConfigFile(cfgPath, sendVer, acceptPP, fw); err != nil {
+		return err
+	}
+	fmt.Printf("%s[OK]%s 已更新 %s: proxy_protocol=%s, accept_proxy_protocol=%v, forward_address=%q\n",
+		ansiGreen, ansiReset, cfgPath, transportext.FormatProxyProtocolVersion(sendVer.Int()), acceptPP, fw)
+	if isServiceActive() {
+		_ = runServiceCommand("restart", cfgPath)
+	}
+	return nil
+}
+
+func runInteractiveProxyProtocolSetup(reader *bufio.Reader, cfgPath string) error {
+	cfg, err := config.Load(cfgPath)
+	if err != nil {
+		return fmt.Errorf("读取配置文件 %s 失败（请先执行配置向导生成配置）: %w", cfgPath, err)
+	}
+
+	curSend := transportext.FormatProxyProtocolVersion(cfg.ProxyProtocol.Int())
+	curAccept := "N"
+	if cfg.AcceptProxyProtocol != nil && *cfg.AcceptProxyProtocol {
+		curAccept = "Y"
+	}
+
+	fmt.Println("--------------------------------------------------------")
+	fmt.Println("  快捷配置 Proxy Protocol v1 / v2 协议头")
+	fmt.Println("--------------------------------------------------------")
+	fmt.Println("  说明:")
+	fmt.Println("    - 发送协议头 (proxy_protocol): 节点向后端/落地转发连接时在首包携带真实客户端 IP:Port")
+	fmt.Println("      可选: 0 (关闭) | v1 (发送 Proxy Protocol v1 文本头) | v2 (发送 Proxy Protocol v2 二进制头)")
+	fmt.Println("    - 接收协议头 (accept_proxy_protocol): 节点入站自动识别并解析前置中转发来的 v1/v2 协议头")
+	fmt.Println("--------------------------------------------------------")
+
+	sendInput := promptLine(reader, "1. 请选择出站发送 Proxy Protocol 版本 (0=关闭, v1=版本1, v2=版本2)", curSend)
+	sendVer, err := config.ParseProxyProtocol(sendInput)
+	if err != nil {
+		return err
+	}
+
+	accInput := promptLine(reader, "2. 是否开启入站接收并解析 Proxy Protocol v1/v2 协议头？(y/N)", curAccept)
+	acceptPP := strings.EqualFold(accInput, "y") || strings.EqualFold(accInput, "yes") || accInput == "1" || strings.EqualFold(accInput, "true")
+
+	fwInput := promptLine(reader, "3. 可选：固定出站转发下游地址 (如 127.0.0.1:8443，留空或输入 none 表示直连原目标)", cfg.ForwardAddress)
+	if strings.EqualFold(fwInput, "none") || strings.EqualFold(fwInput, "off") {
+		fwInput = ""
+	}
+
+	if err := applyProxyProtocolToConfigFile(cfgPath, sendVer, acceptPP, fwInput); err != nil {
+		return err
+	}
+	fmt.Printf("\n%s[OK]%s 已保存 Proxy Protocol 设置至 %s:\n", ansiGreen, ansiReset, cfgPath)
+	fmt.Printf("     发送协议头 (proxy_protocol)        : %s\n", transportext.FormatProxyProtocolVersion(sendVer.Int()))
+	fmt.Printf("     接收协议头 (accept_proxy_protocol) : %v\n", acceptPP)
+	if fwInput != "" {
+		fmt.Printf("     固定转发地址 (forward_address)     : %s\n", fwInput)
+	}
+
+	if isServiceActive() {
+		ans := promptLine(reader, "是否立即重启 Skyline 服务使协议头配置生效？(Y/n)", "Y")
+		if strings.EqualFold(ans, "y") || strings.EqualFold(ans, "yes") {
+			return runServiceCommand("restart", cfgPath)
+		}
+	}
+	return nil
+}
+
+var (
+	reProxyProto       = regexp.MustCompile(`(?m)^(\s*)proxy_protocol\s*:.*$`)
+	reAcceptProxyProto = regexp.MustCompile(`(?m)^(\s*)accept_proxy_protocol\s*:.*$`)
+	reForwardAddress   = regexp.MustCompile(`(?m)^(\s*)#?\s*forward_address\s*:.*$`)
+)
+
+func applyProxyProtocolToConfigFile(cfgPath string, sendVer config.ProxyProtocolVersion, acceptPP bool, forwardAddr string) error {
+	raw, err := os.ReadFile(cfgPath)
+	if err != nil {
+		return err
+	}
+	content := string(raw)
+
+	ppVal := "0"
+	if sendVer > 0 {
+		ppVal = fmt.Sprintf("v%d", sendVer.Int())
+	}
+
+	if reProxyProto.MatchString(content) {
+		content = reProxyProto.ReplaceAllString(content, fmt.Sprintf("${1}proxy_protocol: %s", ppVal))
+	} else {
+		content += fmt.Sprintf("\nproxy_protocol: %s\n", ppVal)
+	}
+
+	if reAcceptProxyProto.MatchString(content) {
+		content = reAcceptProxyProto.ReplaceAllString(content, fmt.Sprintf("${1}accept_proxy_protocol: %v", acceptPP))
+	} else {
+		content += fmt.Sprintf("accept_proxy_protocol: %v\n", acceptPP)
+	}
+
+	forwardAddr = strings.TrimSpace(forwardAddr)
+	if forwardAddr != "" {
+		if reForwardAddress.MatchString(content) {
+			content = reForwardAddress.ReplaceAllString(content, fmt.Sprintf("${1}forward_address: %q", forwardAddr))
+		} else {
+			content += fmt.Sprintf("forward_address: %q\n", forwardAddr)
+		}
+	} else if reForwardAddress.MatchString(content) {
+		content = reForwardAddress.ReplaceAllString(content, `${1}# forward_address: "127.0.0.1:8443"`)
+	}
+
+	if err := os.WriteFile(cfgPath, []byte(content), 0600); err != nil {
+		return err
+	}
+	_, err = config.Load(cfgPath)
+	return err
+}
+
+// ============================================================================
+// REALITY X25519 Keypair & ShortID Generator (`skyline reality`)
+// ============================================================================
+
+func runRealityKeygenCommand() error {
+	priv := make([]byte, 32)
+	if _, err := rand.Read(priv); err != nil {
+		return fmt.Errorf("生成随机数失败: %w", err)
+	}
+	// Clamp X25519 private scalar per RFC 7748
+	priv[0] &= 248
+	priv[31] &= 127
+	priv[31] |= 64
+
+	pub, err := curve25519.X25519(priv, curve25519.Basepoint)
+	if err != nil {
+		return fmt.Errorf("计算 X25519 公钥失败: %w", err)
+	}
+
+	shortBytes := make([]byte, 4)
+	_, _ = rand.Read(shortBytes)
+
+	privB64 := base64.RawURLEncoding.EncodeToString(priv)
+	pubB64 := base64.RawURLEncoding.EncodeToString(pub)
+	shortID := hex.EncodeToString(shortBytes)
+
+	fmt.Println("========================================================")
+	fmt.Println("  Skyline REALITY (X25519) 密钥对与 ShortID 生成结果")
+	fmt.Println("========================================================")
+	fmt.Printf("  PrivateKey (服务端私钥) : %s%s%s\n", ansiGreen, privB64, ansiReset)
+	fmt.Printf("  PublicKey  (客户端公钥) : %s%s%s\n", ansiCyan, pubB64, ansiReset)
+	fmt.Printf("  ShortID    (简短标识)   : %s%s%s\n", ansiYellow, shortID, ansiReset)
+	fmt.Println("--------------------------------------------------------")
+	fmt.Println("  提示: 请将以上参数填入 Xboard 后台 MX 节点的 REALITY (tls=2) 配置中。")
+	return nil
+}
+
+// ============================================================================
+// Xboard MxProtocol Plugin Downloader (`skyline plugin`)
+// ============================================================================
+
+func runPluginDownloadCommand(targetDir string) error {
+	if strings.TrimSpace(targetDir) == "" {
+		targetDir = "."
+	}
+	pluginURL := githubReleaseURL + "/MxProtocol-0.3.1.zip"
+	fmt.Printf("[*] 正在从 GitHub Release 下载 Xboard 插件包: %s ...\n", pluginURL)
+
+	client := &http.Client{Timeout: 60 * time.Second}
+	resp, err := client.Get(pluginURL)
+	if err != nil {
+		return fmt.Errorf("下载插件包失败: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("下载插件包返回 HTTP %d (请访问 https://github.com/%s/releases 手动下载)", resp.StatusCode, githubRepo)
+	}
+
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("读取插件包数据失败: %w", err)
+	}
+
+	zr, err := zip.NewReader(bytes.NewReader(data), int64(len(data)))
+	if err != nil {
+		return fmt.Errorf("解析 ZIP 插件包失败: %w", err)
+	}
+
+	if err := os.MkdirAll(targetDir, 0755); err != nil {
+		return fmt.Errorf("创建目标目录 %s 失败: %w", targetDir, err)
+	}
+
+	for _, f := range zr.File {
+		destPath := filepath.Join(targetDir, f.Name)
+		if !strings.HasPrefix(filepath.Clean(destPath), filepath.Clean(targetDir)) {
+			continue
+		}
+		if f.FileInfo().IsDir() {
+			_ = os.MkdirAll(destPath, 0755)
+			continue
+		}
+		if err := os.MkdirAll(filepath.Dir(destPath), 0755); err != nil {
+			return err
+		}
+		rc, err := f.Open()
+		if err != nil {
+			return err
+		}
+		outFile, err := os.OpenFile(destPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, f.Mode())
+		if err != nil {
+			_ = rc.Close()
+			return err
+		}
+		_, _ = io.Copy(outFile, rc)
+		_ = outFile.Close()
+		_ = rc.Close()
+	}
+
+	fmt.Printf("%s[OK]%s Xboard MxProtocol 插件已成功解压至: %s\n", ansiGreen, ansiReset, filepath.Join(targetDir, "MxProtocol"))
+	fmt.Println("     请将该 MxProtocol 文件夹放入 Xboard 源码的 plugins/ 目录下并在后台「插件管理」中启用。")
+	return nil
+}
+
+// ============================================================================
+// Online Self-Update (`skyline update`)
+// ============================================================================
+
+func runSelfUpdateCommand() error {
+	if runtime.GOOS != "linux" {
+		return fmt.Errorf("在线更新命令仅支持 Linux 系统")
+	}
+	if os.Geteuid() != 0 {
+		return fmt.Errorf("更新程序需要 root 权限，请使用 sudo skyline update")
+	}
+
+	arch := runtime.GOARCH
+	if arch != "amd64" && arch != "arm64" {
+		return fmt.Errorf("当前架构 %s 暂不支持预编译包自动更新，请从源码编译", arch)
+	}
+
+	downloadURL := fmt.Sprintf("%s/skyline-linux-%s", githubReleaseURL, arch)
+	fmt.Printf("[*] 正在从 GitHub Release 下载最新 Linux (%s) 版本: %s ...\n", arch, downloadURL)
+
+	client := &http.Client{Timeout: 120 * time.Second}
+	resp, err := client.Get(downloadURL)
+	if err != nil {
+		return fmt.Errorf("下载失败: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("下载返回 HTTP %d", resp.StatusCode)
+	}
+
+	if err := os.MkdirAll(defaultDir, 0755); err != nil {
+		return err
+	}
+	tmpPath := defaultBinPath + ".new"
+	out, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0755)
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(out, resp.Body); err != nil {
+		_ = out.Close()
+		_ = os.Remove(tmpPath)
+		return err
+	}
+	_ = out.Close()
+
+	if err := os.Rename(tmpPath, defaultBinPath); err != nil {
+		_ = os.Remove(tmpPath)
+		return err
+	}
+	ensureGlobalSymlinks(defaultBinPath)
+
+	fmt.Printf("%s[OK]%s 程序已更新至 %s\n", ansiGreen, ansiReset, defaultBinPath)
+	if isServiceActive() {
+		fmt.Println("[*] 正在重启 Skyline 服务以应用新版本...")
+		return runServiceCommand("restart", defaultCfgPath)
+	}
+	return nil
+}
+
+// ============================================================================
+// Config Generator Wizard (`skyline init`)
+// ============================================================================
+
 func runInitCommand(
 	cfgPath, panelURL, token, nodeIDsStr string,
 	singleNodeID, machineID int,
@@ -73,7 +673,7 @@ func runInitCommand(
 ) error {
 	if cfgPath == "" {
 		if runtime.GOOS == "linux" && os.Geteuid() == 0 {
-			cfgPath = "/etc/skyline/config.yml"
+			cfgPath = defaultCfgPath
 		} else {
 			cfgPath = "config.yml"
 		}
@@ -170,6 +770,7 @@ func runInitCommand(
 	var b strings.Builder
 	b.WriteString("# =============================================================================\n")
 	b.WriteString("# Skyline MX Protocol Backend Configuration (/etc/skyline/config.yml)\n")
+	b.WriteString("# 程序路径: /etc/skyline/skyline | 管理命令: 在终端直接输入 skyline\n")
 	b.WriteString(fmt.Sprintf("# Generated at: %s\n", time.Now().Format(time.RFC3339)))
 	b.WriteString("# =============================================================================\n\n")
 	b.WriteString(fmt.Sprintf("log_level: %s\n", logLevel))
@@ -182,7 +783,7 @@ func runInitCommand(
 	b.WriteString("http_timeout: 15s\n")
 	b.WriteString("device_ttl: 90s\n\n")
 
-	b.WriteString("# Proxy Protocol 协议头配置 (可直接在此修改并执行 skyline service reload 或 restart 生效)\n")
+	b.WriteString("# Proxy Protocol 协议头配置 (可直接在此修改并执行 `skyline reload` 或在 `skyline` 菜单第 9 项切换)\n")
 	b.WriteString("# proxy_protocol: 控制出站连接是否发送 Proxy Protocol 协议头，可选值: 0 (关闭), v1 (或 1), v2 (或 2)\n")
 	if ppVer > 0 {
 		b.WriteString(fmt.Sprintf("proxy_protocol: v%d\n", ppVer.Int()))
@@ -218,7 +819,7 @@ func runInitCommand(
 		return fmt.Errorf("写入配置文件 %s 失败: %w", cfgPath, err)
 	}
 
-	fmt.Printf("\n[OK] 配置文件已成功写入: %s\n", cfgPath)
+	fmt.Printf("\n%s[OK]%s 配置文件已成功写入: %s\n", ansiGreen, ansiReset, cfgPath)
 
 	cfg, err := config.Load(cfgPath)
 	if err != nil {
@@ -235,7 +836,10 @@ func runInitCommand(
 	return nil
 }
 
-// runCheckCommand performs a comprehensive preflight check against Xboard and local node environment.
+// ============================================================================
+// Preflight Diagnostic (`skyline check`)
+// ============================================================================
+
 func runCheckCommand(cfg *config.Config) error {
 	fmt.Println("========================================================")
 	fmt.Printf("  Skyline MX Backend v%s (M-core %s) - 节点自检诊断\n", Version, core.Version())
@@ -262,10 +866,10 @@ func runCheckCommand(cfg *config.Config) error {
 		start := time.Now()
 		resp, err := mc.GetMachineNodes(ctx)
 		if err != nil {
-			fmt.Printf("[FAIL] 机器节点发现失败: %v\n", err)
+			fmt.Printf("%s[FAIL]%s 机器节点发现失败: %v\n", ansiRed, ansiReset, err)
 			return err
 		}
-		fmt.Printf("[PASS] 机器发现成功 (%dms)，共发现 %d 个节点\n", time.Since(start).Milliseconds(), len(resp.Nodes))
+		fmt.Printf("%s[PASS]%s 机器发现成功 (%dms)，共发现 %d 个节点\n", ansiGreen, ansiReset, time.Since(start).Milliseconds(), len(resp.Nodes))
 		for _, n := range resp.Nodes {
 			if strings.EqualFold(n.Type, "mx") {
 				targets = append(targets, config.NodeTargetConfig{
@@ -285,7 +889,7 @@ func runCheckCommand(cfg *config.Config) error {
 			}
 		}
 		if len(targets) == 0 {
-			fmt.Println("[WARN] 当前机器名下尚未绑定任何启用状态的 MX 节点")
+			fmt.Printf("%s[WARN]%s 当前机器名下尚未绑定任何启用状态的 MX 节点\n", ansiYellow, ansiReset)
 			return nil
 		}
 	}
@@ -307,12 +911,12 @@ func runCheckCommand(cfg *config.Config) error {
 		nodeCfg, _, err := client.GetNodeConfig(ctx)
 		latency := time.Since(t0).Milliseconds()
 		if err != nil {
-			fmt.Printf("  [FAIL] 拉取节点配置失败 (%dms): %v\n", latency, err)
+			fmt.Printf("  %s[FAIL]%s 拉取节点配置失败 (%dms): %v\n", ansiRed, ansiReset, latency, err)
 			fmt.Println("         排查建议: 1) 检查 panel_url 与 token 是否正确; 2) 确认 Xboard 后台已安装并启用 MxProtocol 插件; 3) 确认节点 ID 存在且为 mx 类型。")
 			hasError = true
 			continue
 		}
-		fmt.Printf("  [PASS] 面板通讯成功 (延迟: %dms)\n", latency)
+		fmt.Printf("  %s[PASS]%s 面板通讯成功 (延迟: %dms)\n", ansiGreen, ansiReset, latency)
 
 		tlsDesc := "无 TLS (Plaintext)"
 		switch nodeCfg.TLS {
@@ -333,7 +937,6 @@ func runCheckCommand(cfg *config.Config) error {
 			nodeCfg.ListenIP, nodeCfg.ServerPort, nodeCfg.Network, tlsDesc,
 			transportext.FormatProxyProtocolVersion(sendPP), acceptPP, len(nodeCfg.Routes))
 
-		// Validate TLS / REALITY config locally
 		if nodeCfg.TLS == 2 {
 			if _, err := transportext.BuildRealityConfig(
 				nodeCfg.TLSSettings.ServerName,
@@ -342,10 +945,10 @@ func runCheckCommand(cfg *config.Config) error {
 				nodeCfg.TLSSettings.ShortID,
 				nodeCfg.TLSSettings.ServerPort,
 			); err != nil {
-				fmt.Printf("  [FAIL] REALITY 密钥校验失败: %v\n", err)
+				fmt.Printf("  %s[FAIL]%s REALITY 密钥校验失败: %v\n", ansiRed, ansiReset, err)
 				hasError = true
 			} else {
-				fmt.Println("  [PASS] REALITY X25519 密钥对校验通过")
+				fmt.Printf("  %s[PASS]%s REALITY X25519 密钥对校验通过\n", ansiGreen, ansiReset)
 			}
 		} else if nodeCfg.TLS == 1 {
 			certFile := t.CertFile
@@ -365,23 +968,21 @@ func runCheckCommand(cfg *config.Config) error {
 				nodeCfg.CertConfig.KeyPem,
 				nodeCfg.TLSSettings.AllowInsecure.Bool(),
 			); err != nil {
-				fmt.Printf("  [FAIL] TLS 证书校验失败: %v\n", err)
+				fmt.Printf("  %s[FAIL]%s TLS 证书校验失败: %v\n", ansiRed, ansiReset, err)
 				hasError = true
 			} else {
-				fmt.Println("  [PASS] TLS 证书配置就绪")
+				fmt.Printf("  %s[PASS]%s TLS 证书配置就绪\n", ansiGreen, ansiReset)
 			}
 		}
 
-		// Pull active users
 		users, _, err := client.GetUsers(ctx)
 		if err != nil {
-			fmt.Printf("  [FAIL] 拉取授权用户列表失败: %v\n", err)
+			fmt.Printf("  %s[FAIL]%s 拉取授权用户列表失败: %v\n", ansiRed, ansiReset, err)
 			hasError = true
 		} else {
-			fmt.Printf("  [PASS] 授权用户列表拉取成功 (当前有效用户数: %d)\n", len(users))
+			fmt.Printf("  %s[PASS]%s 授权用户列表拉取成功 (当前有效用户数: %d)\n", ansiGreen, ansiReset, len(users))
 		}
 
-		// Check local port availability
 		bindIP := t.ListenIP
 		if bindIP == "" {
 			bindIP = nodeCfg.ListenIP
@@ -392,10 +993,10 @@ func runCheckCommand(cfg *config.Config) error {
 		addr := fmt.Sprintf("%s:%d", bindIP, nodeCfg.ServerPort)
 		ln, err := net.Listen("tcp", addr)
 		if err != nil {
-			fmt.Printf("  [WARN] 本地端口 %s 已被占用或无权限绑定 (%v) — 若 Skyline 服务已在运行则属正常现象\n", addr, err)
+			fmt.Printf("  %s[WARN]%s 本地端口 %s 已被占用或无权限绑定 (%v) — 若 Skyline 服务已在运行则属正常现象\n", ansiYellow, ansiReset, addr, err)
 		} else {
 			_ = ln.Close()
-			fmt.Printf("  [PASS] 本地监听端口 %s 可用\n", addr)
+			fmt.Printf("  %s[PASS]%s 本地监听端口 %s 可用\n", ansiGreen, ansiReset, addr)
 		}
 	}
 
@@ -403,56 +1004,57 @@ func runCheckCommand(cfg *config.Config) error {
 	if hasError {
 		return fmt.Errorf("节点自检发现异常，请根据上方提示修正配置")
 	}
-	fmt.Println("[SUCCESS] 所有节点自检全部通过！可执行 `skyline run` 或 `skyline service start` 启动服务。")
+	fmt.Printf("%s[SUCCESS]%s 所有节点自检全部通过！直接输入 `skyline` 或 `skyline start` 即可管理与启动服务。\n", ansiGreen, ansiReset)
 	return nil
 }
 
-// runServiceCommand manages the Linux systemd service for Skyline.
-// Both the binary (/etc/skyline/skyline) and config (/etc/skyline/config.yml) live in /etc/skyline.
+// ============================================================================
+// Systemd Service Management (`skyline service <action>` / `skyline <action>`)
+// ============================================================================
+
+func ensureGlobalSymlinks(targetBin string) {
+	for _, linkPath := range []string{symlinkBinPath, usrBinPath} {
+		_ = os.Remove(linkPath)
+		if err := os.Symlink(targetBin, linkPath); err != nil {
+			_ = copyExecutable(targetBin, linkPath)
+		}
+	}
+}
+
 func runServiceCommand(action string, cfgPath string) error {
 	if runtime.GOOS != "linux" {
-		return fmt.Errorf("`skyline service` 命令仅在 Linux 系统 (systemd) 下可用")
+		return fmt.Errorf("`skyline %s` 服务管理命令仅在 Linux 系统 (systemd) 下可用", action)
 	}
 	action = strings.ToLower(strings.TrimSpace(action))
 	if cfgPath == "" {
-		cfgPath = "/etc/skyline/config.yml"
+		cfgPath = defaultCfgPath
 	}
 	absCfgPath, err := filepath.Abs(cfgPath)
 	if err == nil {
 		cfgPath = absCfgPath
 	}
 
-	const (
-		skylineDir  = "/etc/skyline"
-		targetBin   = "/etc/skyline/skyline"
-		symlinkBin  = "/usr/local/bin/skyline"
-		serviceFile = "/etc/systemd/system/skyline.service"
-	)
-
 	switch action {
 	case "install":
 		if os.Geteuid() != 0 {
-			return fmt.Errorf("安装 systemd 服务需要 root 权限，请使用 sudo skyline service install")
+			return fmt.Errorf("安装 systemd 服务需要 root 权限，请使用 sudo skyline install")
 		}
-		if err := os.MkdirAll(skylineDir, 0755); err != nil {
-			return fmt.Errorf("创建目录 %s 失败: %w", skylineDir, err)
+		if err := os.MkdirAll(defaultDir, 0755); err != nil {
+			return fmt.Errorf("创建目录 %s 失败: %w", defaultDir, err)
 		}
 		exePath, err := os.Executable()
 		if err != nil {
 			return fmt.Errorf("获取当前可执行文件路径失败: %w", err)
 		}
 		exePath, _ = filepath.EvalSymlinks(exePath)
-		if exePath != targetBin {
-			if err := copyExecutable(exePath, targetBin); err != nil {
-				return fmt.Errorf("复制二进制文件到 %s 失败: %w", targetBin, err)
+		if exePath != defaultBinPath {
+			if err := copyExecutable(exePath, defaultBinPath); err != nil {
+				return fmt.Errorf("复制二进制文件到 %s 失败: %w", defaultBinPath, err)
 			}
-			fmt.Printf("[OK] 已安装程序到目录: %s\n", targetBin)
+			fmt.Printf("%s[OK]%s 已安装程序到目录: %s\n", ansiGreen, ansiReset, defaultBinPath)
 		}
-		// Create symlink in /usr/local/bin/skyline -> /etc/skyline/skyline for global CLI invocation
-		_ = os.Remove(symlinkBin)
-		if err := os.Symlink(targetBin, symlinkBin); err != nil {
-			_ = copyExecutable(targetBin, symlinkBin)
-		}
+		ensureGlobalSymlinks(defaultBinPath)
+		fmt.Printf("%s[OK]%s 已注册全局终端命令: `skyline` (软链接: %s -> %s)\n", ansiGreen, ansiReset, symlinkBinPath, defaultBinPath)
 
 		unitContent := fmt.Sprintf(`[Unit]
 Description=Skyline MX Protocol Backend for Xboard
@@ -475,12 +1077,12 @@ StandardError=journal
 
 [Install]
 WantedBy=multi-user.target
-`, targetBin, cfgPath)
+`, defaultBinPath, cfgPath)
 
-		if err := os.WriteFile(serviceFile, []byte(unitContent), 0644); err != nil {
-			return fmt.Errorf("写入 %s 失败: %w", serviceFile, err)
+		if err := os.WriteFile(systemdUnitPath, []byte(unitContent), 0644); err != nil {
+			return fmt.Errorf("写入 %s 失败: %w", systemdUnitPath, err)
 		}
-		fmt.Printf("[OK] 已生成 systemd 单元文件: %s\n", serviceFile)
+		fmt.Printf("%s[OK]%s 已生成 systemd 单元文件: %s\n", ansiGreen, ansiReset, systemdUnitPath)
 
 		if err := runSystemctl("daemon-reload"); err != nil {
 			return err
@@ -492,10 +1094,10 @@ WantedBy=multi-user.target
 			if err := runSystemctl("restart", "skyline"); err != nil {
 				return err
 			}
-			fmt.Println("[OK] Skyline 服务已启动并设置为开机自启！（程序与配置均位于 /etc/skyline）")
+			fmt.Printf("%s[OK]%s Skyline 服务已启动并设置为开机自启！（任何时候在终端输入 `skyline` 即可打开管理面板）\n", ansiGreen, ansiReset)
 			_ = runSystemctl("status", "--no-pager", "skyline")
 		} else {
-			fmt.Printf("[WARN] 尚未检测到配置文件 %s，请先运行 `skyline init` 生成配置后再执行 `skyline service start`。\n", cfgPath)
+			fmt.Printf("%s[WARN]%s 尚未检测到配置文件 %s，请运行 `skyline init` 或直接输入 `skyline` 进入管理面板生成配置。\n", ansiYellow, ansiReset, cfgPath)
 		}
 		return nil
 
@@ -505,16 +1107,19 @@ WantedBy=multi-user.target
 		}
 		_ = runSystemctl("stop", "skyline")
 		_ = runSystemctl("disable", "skyline")
-		_ = os.Remove(serviceFile)
+		_ = os.Remove(systemdUnitPath)
 		_ = runSystemctl("daemon-reload")
-		fmt.Println("[OK] Skyline systemd 服务已卸载。")
+		_ = os.Remove(symlinkBinPath)
+		_ = os.Remove(usrBinPath)
+		_ = os.Remove(defaultBinPath)
+		fmt.Printf("%s[OK]%s Skyline 服务与程序已卸载（配置文件保留在 %s）。\n", ansiGreen, ansiReset, cfgPath)
 		return nil
 
-	case "start", "stop", "restart", "reload":
+	case "start", "stop", "restart", "reload", "enable", "disable":
 		if err := runSystemctl(action, "skyline"); err != nil {
 			return err
 		}
-		fmt.Printf("[OK] skyline 服务已执行 %s\n", action)
+		fmt.Printf("%s[OK]%s skyline 服务已执行 %s\n", ansiGreen, ansiReset, action)
 		return nil
 
 	case "status":
@@ -569,26 +1174,28 @@ func printUsage() {
 程序与配置文件统一存放目录: /etc/skyline (/etc/skyline/skyline & /etc/skyline/config.yml)
 
 用法 (Usage):
+  skyline                    直接进入交互式终端管理面板 (推荐！)
   skyline [命令] [参数]
 
-核心命令 (Commands):
-  run                启动 Skyline 节点后端守护进程（默认命令，可省略）
-  init               交互式向导或命令行一键生成 /etc/skyline/config.yml 配置文件
-  check / doctor     检测与 Xboard 面板连通性、核验密钥与节点 TLS/REALITY/ProxyProtocol 配置
-  service <action>   管理 Linux systemd 服务:
-                       install   安装程序至 /etc/skyline/skyline 并启用开机自启服务
-                       uninstall 停止并移除 systemd 服务
-                       start     启动服务
-                       stop      停止服务
-                       restart   重启服务
-                       reload    热重载配置文件 (/etc/skyline/config.yml)
-                       status    查看服务运行状态
-                       log       实时查看服务运行日志 (journalctl -f)
-  version            显示版本与内核信息
-  help               显示本帮助说明
+快捷管理命令 (Management Commands):
+  (无参数) / menu            打开交互式中文管理面板（启停服务、修改配置、切换 Proxy Protocol、诊断等）
+  init                       交互式向导或命令行一键生成 /etc/skyline/config.yml
+  config / edit              直接调用编辑器修改 /etc/skyline/config.yml 并在保存后自动校验与热重载
+  pp                         快捷配置 Proxy Protocol v1/v2 协议头 (发送 / 接收 / 转发地址)
+  check / doctor             检测与 Xboard 面板连通性、核验密钥、TLS/REALITY 及 Proxy Protocol 状态
+  start / stop / restart     启动 / 停止 / 重启 Skyline systemd 服务
+  reload                     平滑热重载 /etc/skyline/config.yml 配置文件
+  status                     查看 Skyline 服务运行状态
+  log / logs                 实时滚动查看服务运行日志 (journalctl -u skyline -f)
+  reality                    一键生成 REALITY X25519 公私钥对与 ShortID
+  plugin [dir]               从 GitHub Release 下载并解压 Xboard MxProtocol 插件包
+  install / uninstall        安装或卸载 Linux systemd 开机自启服务
+  update                     在线更新 Skyline 到 GitHub Release 最新版本
+  run                        在前台运行 Skyline 节点守护进程 (供 systemd 或容器调用)
+  version / help             查看版本信息或本帮助说明
 
 常用参数 (Flags):
-  -c, --config <path>           配置文件路径 (默认自动查找 /etc/skyline/config.yml)
+  -c, --config <path>           配置文件路径 (默认: /etc/skyline/config.yml)
   --panel <url>                 Xboard 面板地址 (例如 https://panel.example.com)
   --token <token>               Xboard 通讯密钥 (server_token 或 machine_token)
   --node-id <id>                单个 MX 节点 ID
@@ -603,13 +1210,5 @@ func printUsage() {
   --key-file <path>             TLS 私钥文件路径 (可选)
   --log-level <level>           日志级别: debug, info, warning, error, none
   -y, --yes                     在 init 命令中使用非交互模式
-
-快速上手示例 (Examples):
-  1. 交互式初始化配置 (/etc/skyline/config.yml) 并自检:
-     skyline init
-
-  2. 一行命令生成配置（开启 Proxy Protocol v2 发送）并安装启动服务:
-     skyline init --panel https://panel.example.com --token YOUR_TOKEN --node-id 1 --proxy-protocol v2 -y
-     sudo skyline service install
 `, Version, core.Version())
 }

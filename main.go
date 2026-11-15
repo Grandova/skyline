@@ -20,9 +20,18 @@ import (
 const Version = "0.3.1"
 
 func main() {
-	subcmd := "run"
 	args := os.Args[1:]
-	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
+
+	// When invoked in terminal with no arguments (`skyline`), launch the interactive management panel.
+	if len(args) == 0 {
+		if err := runManageMenu(resolveDefaultConfigPath("")); err != nil {
+			log.Fatalf("[Skyline] %v", err)
+		}
+		return
+	}
+
+	subcmd := "run"
+	if !strings.HasPrefix(args[0], "-") {
 		subcmd = strings.ToLower(strings.TrimSpace(args[0]))
 		args = args[1:]
 	}
@@ -32,21 +41,68 @@ func main() {
 		fmt.Printf("Skyline MX Backend v%s (M-core %s, %s/%s, %s)\n",
 			Version, core.Version(), runtime.GOOS, runtime.GOARCH, runtime.Version())
 		return
+
 	case "help", "-h", "--help":
 		printUsage()
 		return
+
+	case "menu", "manage", "panel", "ui":
+		cfgPath := parseConfigFlagOnly(subcmd, args)
+		if err := runManageMenu(resolveDefaultConfigPath(cfgPath)); err != nil {
+			log.Fatalf("[Skyline] %v", err)
+		}
+		return
+
+	case "reality", "x25519", "keygen":
+		if err := runRealityKeygenCommand(); err != nil {
+			log.Fatalf("[Skyline] %v", err)
+		}
+		return
+
+	case "plugin":
+		targetDir := ""
+		if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
+			targetDir = args[0]
+		}
+		if err := runPluginDownloadCommand(targetDir); err != nil {
+			log.Fatalf("[Skyline] %v", err)
+		}
+		return
+
+	case "update", "upgrade":
+		if err := runSelfUpdateCommand(); err != nil {
+			log.Fatalf("[Skyline] %v", err)
+		}
+		return
+
+	case "config", "edit":
+		cfgPath := parseConfigFlagOnly(subcmd, args)
+		if err := runEditConfigCommand(resolveDefaultConfigPath(cfgPath)); err != nil {
+			log.Fatalf("[Skyline] %v", err)
+		}
+		return
+
+	case "pp", "proxy-protocol":
+		if err := runProxyProtocolCLI(args); err != nil {
+			log.Fatalf("[Skyline] %v", err)
+		}
+		return
+
+	case "start", "stop", "restart", "reload", "status", "enable", "disable", "log", "logs", "install", "uninstall":
+		cfgPath := parseConfigFlagOnly(subcmd, args)
+		if err := runServiceCommand(subcmd, resolveDefaultConfigPath(cfgPath)); err != nil {
+			log.Fatalf("[Skyline] %v", err)
+		}
+		return
+
 	case "service", "svc":
 		action := "status"
 		if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
 			action = args[0]
 			args = args[1:]
 		}
-		fs := flag.NewFlagSet("service", flag.ExitOnError)
-		var cfgPath string
-		fs.StringVar(&cfgPath, "c", "", "Path to config file")
-		fs.StringVar(&cfgPath, "config", "", "Path to config file")
-		_ = fs.Parse(args)
-		if err := runServiceCommand(action, cfgPath); err != nil {
+		cfgPath := parseConfigFlagOnly("service", args)
+		if err := runServiceCommand(action, resolveDefaultConfigPath(cfgPath)); err != nil {
 			log.Fatalf("[Skyline] %v", err)
 		}
 		return
@@ -103,32 +159,18 @@ func main() {
 		return
 	}
 
-	if subcmd == "init" {
+	if subcmd == "init" || subcmd == "setup" {
 		if err := runInitCommand(configPath, panelURL, token, nodeIDsStr, nodeID, machineID, apiVersion, listenIP, proxyProtocol, acceptProxyProtocol, forwardAddress, logLevel, nonInteractive); err != nil {
 			log.Fatalf("[Skyline] %v", err)
 		}
 		return
 	}
 
-	if configPath == "" {
-		for _, candidate := range []string{
-			"/etc/skyline/config.yml",
-			"/etc/skyline/config.yaml",
-			"/etc/skyline/config.json",
-			"config.yml",
-			"config.yaml",
-			"config.json",
-		} {
-			if st, err := os.Stat(candidate); err == nil && !st.IsDir() {
-				configPath = candidate
-				break
-			}
-		}
-	}
+	configPath = resolveDefaultConfigPath(configPath)
 
 	cfg, err := loadAndMergeConfig(configPath, panelURL, token, nodeID, nodeIDsStr, nodeType, machineID, apiVersion, listenIP, certFile, keyFile, proxyProtocol, acceptProxyProtocol, forwardAddress, logLevel)
 	if err != nil {
-		log.Fatalf("[Skyline] %v\n提示: 可运行 `skyline init` 向导生成配置文件 (/etc/skyline/config.yml)，或运行 `skyline help` 查看参数说明。", err)
+		log.Fatalf("[Skyline] %v\n提示: 直接输入 `skyline` 可进入交互式管理面板，或运行 `skyline init` 生成配置文件 (/etc/skyline/config.yml)。", err)
 	}
 
 	switch subcmd {
@@ -137,10 +179,10 @@ func main() {
 			os.Exit(1)
 		}
 		return
-	case "run", "start":
+	case "run":
 		// Proceed to daemon startup below
 	default:
-		log.Fatalf("[Skyline] 未知命令 %q，请运行 `skyline help` 查看支持的命令。", subcmd)
+		log.Fatalf("[Skyline] 未知命令 %q，直接输入 `skyline` 可进入管理面板，或运行 `skyline help` 查看帮助。", subcmd)
 	}
 
 	logger := log.New(os.Stdout, "[Skyline] ", log.LstdFlags)
@@ -185,6 +227,38 @@ func main() {
 	logger.Printf("Skyline stopped.")
 }
 
+func parseConfigFlagOnly(name string, args []string) string {
+	fs := flag.NewFlagSet(name, flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	var cfgPath string
+	fs.StringVar(&cfgPath, "c", "", "Path to config file")
+	fs.StringVar(&cfgPath, "config", "", "Path to config file")
+	_ = fs.Parse(args)
+	return cfgPath
+}
+
+func resolveDefaultConfigPath(configPath string) string {
+	if strings.TrimSpace(configPath) != "" {
+		return configPath
+	}
+	for _, candidate := range []string{
+		"/etc/skyline/config.yml",
+		"/etc/skyline/config.yaml",
+		"/etc/skyline/config.json",
+		"config.yml",
+		"config.yaml",
+		"config.json",
+	} {
+		if st, err := os.Stat(candidate); err == nil && !st.IsDir() {
+			return candidate
+		}
+	}
+	if runtime.GOOS == "linux" {
+		return "/etc/skyline/config.yml"
+	}
+	return "config.yml"
+}
+
 func loadAndMergeConfig(
 	configPath, panelURL, token string,
 	nodeID int,
@@ -194,9 +268,21 @@ func loadAndMergeConfig(
 	acceptProxyProtocol bool,
 	forwardAddress, logLevel string,
 ) (*config.Config, error) {
-	cfg, err := config.Load(configPath)
-	if err != nil {
-		return nil, fmt.Errorf("加载配置文件失败: %w", err)
+	var cfg *config.Config
+	if configPath != "" {
+		if st, err := os.Stat(configPath); err == nil && !st.IsDir() {
+			loaded, loadErr := config.Load(configPath)
+			if loadErr != nil {
+				return nil, fmt.Errorf("加载配置文件失败: %w", loadErr)
+			}
+			cfg = loaded
+		} else if panelURL == "" && os.Getenv("SKYLINE_PANEL_URL") == "" {
+			return nil, fmt.Errorf("未找到配置文件 %s", configPath)
+		}
+	}
+	if cfg == nil {
+		cfg = config.Default()
+		cfg.ApplyEnv()
 	}
 
 	if panelURL != "" {

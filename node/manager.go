@@ -285,10 +285,43 @@ func (w *NodeWorker) Stop() error {
 	flushCtx, flushCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer flushCancel()
 	if traffic := w.engine.CollectAndResetTraffic(); len(traffic) > 0 {
-		_ = w.client.PushTraffic(flushCtx, traffic)
+		if w.targetCfg.APIVersion == "v2" {
+			report := panel.NodeReport{
+				Traffic: make(map[string][2]int64, len(traffic)),
+			}
+			for uid, pair := range traffic {
+				report.Traffic[strconv.Itoa(uid)] = pair
+			}
+			_ = w.client.PushReport(flushCtx, report)
+		} else {
+			_ = w.client.PushTraffic(flushCtx, traffic)
+		}
 	}
 
 	return w.engine.Close()
+}
+
+func targetNeedsWorkerRecreate(oldT, newT config.NodeTargetConfig) bool {
+	oldAccept := false
+	if oldT.AcceptProxyProtocol != nil {
+		oldAccept = *oldT.AcceptProxyProtocol
+	}
+	newAccept := false
+	if newT.AcceptProxyProtocol != nil {
+		newAccept = *newT.AcceptProxyProtocol
+	}
+	return oldT.PanelURL != newT.PanelURL ||
+		oldT.Token != newT.Token ||
+		oldT.NodeID != newT.NodeID ||
+		oldT.NodeType != newT.NodeType ||
+		oldT.MachineID != newT.MachineID ||
+		oldT.APIVersion != newT.APIVersion ||
+		oldT.ListenIP != newT.ListenIP ||
+		oldT.CertFile != newT.CertFile ||
+		oldT.KeyFile != newT.KeyFile ||
+		oldT.ProxyProtocol != newT.ProxyProtocol ||
+		oldAccept != newAccept ||
+		oldT.ForwardAddress != newT.ForwardAddress
 }
 
 // Manager coordinates all configured NodeWorkers (including Xboard V2 Machine mode).
@@ -422,6 +455,75 @@ func (m *Manager) machineLoop(ctx context.Context) {
 			}
 		}
 	}
+}
+
+// Reload hot-reloads the Manager with a new configuration without dropping unchanged node workers.
+func (m *Manager) Reload(parentCtx context.Context, newCfg *config.Config) error {
+	if err := newCfg.Validate(); err != nil {
+		return err
+	}
+
+	// If switching to/from machine mode, perform full restart
+	if (m.cfg.MachineID > 0 && len(m.cfg.Nodes) == 0) != (newCfg.MachineID > 0 && len(newCfg.Nodes) == 0) {
+		_ = m.Stop()
+		m.cfg = newCfg
+		return m.Start(parentCtx)
+	}
+
+	if newCfg.MachineID > 0 && len(newCfg.Nodes) == 0 {
+		m.mu.Lock()
+		m.cfg = newCfg
+		m.mu.Unlock()
+		return m.syncMachineNodes(parentCtx)
+	}
+
+	desired := make(map[int]config.NodeTargetConfig, len(newCfg.Nodes))
+	for _, t := range newCfg.Nodes {
+		desired[t.NodeID] = t
+	}
+
+	m.mu.Lock()
+	var toStop []*NodeWorker
+	for id, w := range m.workers {
+		newTarget, stillWanted := desired[id]
+		if !stillWanted || targetNeedsWorkerRecreate(w.targetCfg, newTarget) {
+			toStop = append(toStop, w)
+			delete(m.workers, id)
+		} else {
+			w.mu.Lock()
+			w.targetCfg = newTarget
+			if newTarget.PullInterval > 0 {
+				w.pullInterval = newTarget.PullInterval
+			}
+			if newTarget.PushInterval > 0 {
+				w.pushInterval = newTarget.PushInterval
+			}
+			w.mu.Unlock()
+			w.client.ResetETags()
+		}
+	}
+	m.cfg = newCfg
+	m.mu.Unlock()
+
+	for _, w := range toStop {
+		_ = w.Stop()
+	}
+
+	for id, target := range desired {
+		m.mu.Lock()
+		_, exists := m.workers[id]
+		m.mu.Unlock()
+		if !exists {
+			w := NewNodeWorker(target, m.logger)
+			m.mu.Lock()
+			m.workers[id] = w
+			m.mu.Unlock()
+			if err := w.Start(parentCtx); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 // Stop gracefully stops all running NodeWorkers.

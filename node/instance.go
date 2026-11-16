@@ -510,12 +510,16 @@ func (e *NodeEngine) buildStreamConfig(nodeCfg *panel.NodeConfig) (*internet.Str
 		streamCfg.TransportSettings = []*internet.TransportConfig{tc}
 
 	case "grpc", "gun":
+		svcName := strings.TrimSpace(ns.ServiceName)
+		if svcName == "" {
+			svcName = "GunService"
+		}
 		streamCfg.ProtocolName = "gun"
 		streamCfg.TransportSettings = []*internet.TransportConfig{
 			{
 				ProtocolName: "gun",
 				Settings: serial.ToTypedMessage(&grpc.Config{
-					ServiceName: ns.ServiceName,
+					ServiceName: svcName,
 				}),
 			},
 		}

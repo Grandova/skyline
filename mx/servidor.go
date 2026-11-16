@@ -76,19 +76,22 @@ func (s *Servidor) Process(ctx context.Context, _ net.Network, conexion internet
 		wrapper.FastAuthResult.Status == FastAuthStatusOK &&
 		wrapper.FastAuthProtocol == FastAuthProtocol &&
 		wrapper.FastAuthTarget.IsValid() {
-		usuario := s.validador.Buscar(wrapper.FastAuthToken)
-		if usuario == nil {
-			if u, ok := wrapper.FastAuthUser.(*protocol.MemoryUser); ok {
-				usuario = u
+		var usuario *protocol.MemoryUser
+		if wrapper.FastAuthToken != "" {
+			usuario = s.validador.Buscar(wrapper.FastAuthToken)
+		} else if u, ok := wrapper.FastAuthUser.(*protocol.MemoryUser); ok && u != nil && u.Account != nil {
+			if cuenta, ok := u.Account.(*CuentaMemoria); ok {
+				usuario = s.validador.Buscar(cuenta.Id)
 			}
 		}
-		if usuario != nil {
-			return s.procesarRapido(ctx, conexion, despachador, &ResultadoAutenticacionRapida{
-				Protocolo: wrapper.FastAuthProtocol,
-				Usuario:   usuario,
-				Destino:   wrapper.FastAuthTarget,
-			})
+		if usuario == nil {
+			return errors.New("mx: usuario invalido")
 		}
+		return s.procesarRapido(ctx, conexion, despachador, &ResultadoAutenticacionRapida{
+			Protocolo: wrapper.FastAuthProtocol,
+			Usuario:   usuario,
+			Destino:   wrapper.FastAuthTarget,
+		})
 	}
 
 	sesionPolitica := s.politicas.ForLevel(0)

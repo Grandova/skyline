@@ -207,12 +207,10 @@ func main() {
 				logger.Printf("Configuration reload rejected: %v", err)
 				continue
 			}
-			_ = mgr.Stop()
-			mgr = node.NewManager(newCfg, logger)
-			if err := mgr.Start(ctx); err != nil {
-				logger.Printf("Failed to restart manager after reload: %v", err)
+			if err := mgr.Reload(ctx, newCfg); err != nil {
+				logger.Printf("Failed to reload manager: %v", err)
 			} else {
-				logger.Printf("Configuration reloaded successfully.")
+				logger.Printf("Configuration hot-reloaded successfully.")
 			}
 			continue
 		}

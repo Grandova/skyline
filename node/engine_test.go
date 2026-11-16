@@ -831,3 +831,71 @@ func TestProxyProtocolV1AndV2SendAndReceive(t *testing.T) {
 		})
 	}
 }
+
+func TestMultiNodeFastAuthIsolationAndDefaultGRPC(t *testing.T) {
+	echoPort, stopEcho := startTCPEchoServer(t)
+	defer stopEcho()
+
+	portNode1 := getFreePort(t)
+	portNode2 := getFreePort(t)
+
+	engine1 := node.NewNodeEngine(node.EngineOptions{
+		NodeID:   201,
+		LogLevel: "none",
+		ListenIP: "127.0.0.1",
+	})
+	defer engine1.Close()
+
+	engine2 := node.NewNodeEngine(node.EngineOptions{
+		NodeID:   202,
+		LogLevel: "none",
+		ListenIP: "127.0.0.1",
+	})
+	defer engine2.Close()
+
+	uuidNode1Only := "aaaaaaaa-1111-1111-1111-111111111111"
+	uuidNode2Only := "bbbbbbbb-2222-2222-2222-222222222222"
+
+	cfg1 := &panel.NodeConfig{
+		Host:            "127.0.0.1",
+		ListenIP:        "127.0.0.1",
+		ServerPort:      portNode1,
+		Network:         "ws",
+		NetworkSettings: panel.NetworkSettings{Path: "/ws1"},
+		Protocol:        "mx",
+	}
+	cfg2 := &panel.NodeConfig{
+		Host:            "127.0.0.1",
+		ListenIP:        "127.0.0.1",
+		ServerPort:      portNode2,
+		Network:         "ws",
+		NetworkSettings: panel.NetworkSettings{Path: "/ws2"},
+		Protocol:        "mx",
+	}
+
+	if _, err := engine1.ApplyConfig(cfg1, []panel.User{{ID: 1, UUID: uuidNode1Only}}); err != nil {
+		t.Fatalf("engine1 ApplyConfig: %v", err)
+	}
+	if _, err := engine2.ApplyConfig(cfg2, []panel.User{{ID: 2, UUID: uuidNode2Only}}); err != nil {
+		t.Fatalf("engine2 ApplyConfig: %v", err)
+	}
+
+	// User 1 (authorized only on Node 1) must NOT be able to proxy traffic through Node 2 via FastAuth
+	if _, err := dialViaMXClient(t, portNode2, uuidNode1Only, "ws", panel.NetworkSettings{Path: "/ws2"}, 0, "", echoPort, []byte("unauthorized")); err == nil {
+		t.Fatalf("expected user from Node 1 to be rejected on Node 2, but succeeded")
+	}
+
+	// User 2 (authorized on Node 2) must succeed on Node 2 and record traffic under User 2
+	msg := []byte("hello-node2-fastauth")
+	reply, err := dialViaMXClient(t, portNode2, uuidNode2Only, "ws", panel.NetworkSettings{Path: "/ws2"}, 0, "", echoPort, msg)
+	if err != nil {
+		t.Fatalf("expected User 2 to succeed on Node 2, got error: %v", err)
+	}
+	if !bytes.Equal(reply, msg) {
+		t.Fatalf("reply mismatch on Node 2")
+	}
+	traffic2 := engine2.CollectAndResetTraffic()
+	if _, ok := traffic2[2]; !ok {
+		t.Fatalf("expected traffic for user 2 on Node 2, got %v", traffic2)
+	}
+}

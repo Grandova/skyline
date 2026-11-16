@@ -89,6 +89,24 @@ func normalizePath(p string) string {
 	return p
 }
 
+func decodeBase64EarlyData(raw string) ([]byte, bool) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil, false
+	}
+	for _, enc := range []*base64.Encoding{
+		base64.RawURLEncoding,
+		base64.URLEncoding,
+		base64.RawStdEncoding,
+		base64.StdEncoding,
+	} {
+		if b, err := enc.DecodeString(raw); err == nil && len(b) > 0 {
+			return b, true
+		}
+	}
+	return nil, false
+}
+
 var registerOnce sync.Once
 
 // RegisterAll registers mxws, xhttp, jatp, mc1, and mundordp listeners and dialers into v2ray-core's internet package.
@@ -283,24 +301,28 @@ func (l *httpStreamListener) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	if strings.EqualFold(r.Header.Get("Upgrade"), "websocket") {
 		respHeader := http.Header{}
 		var earlyData []byte
-		if l.cfg.MaxEarlyData > 0 {
-			if l.cfg.EarlyDataHeaderName != "" {
-				if ed := r.Header.Get(l.cfg.EarlyDataHeaderName); ed != "" {
-					earlyData, _ = base64.RawURLEncoding.DecodeString(ed)
-				}
-			} else if wsap := r.Header.Values("Sec-WebSocket-Protocol"); len(wsap) > 0 {
-				rawED := strings.TrimSpace(strings.Split(wsap[0], ",")[0])
-				if rawED != "" {
-					if decoded, err := base64.RawURLEncoding.DecodeString(rawED); err == nil {
-						earlyData = decoded
-						respHeader.Set("Sec-WebSocket-Protocol", rawED)
+		if l.cfg.EarlyDataHeaderName != "" {
+			if ed := strings.TrimSpace(r.Header.Get(l.cfg.EarlyDataHeaderName)); ed != "" {
+				if decoded, ok := decodeBase64EarlyData(ed); ok {
+					earlyData = decoded
+					if strings.EqualFold(l.cfg.EarlyDataHeaderName, "Sec-WebSocket-Protocol") {
+						respHeader.Set("Sec-WebSocket-Protocol", ed)
 					}
 				}
 			}
-		} else if expectedPath != "/" && strings.HasPrefix(reqPath, expectedPath+"/") {
+		} else if wsap := r.Header.Values("Sec-WebSocket-Protocol"); len(wsap) > 0 {
+			rawED := strings.TrimSpace(strings.Split(wsap[0], ",")[0])
+			if rawED != "" {
+				if decoded, ok := decodeBase64EarlyData(rawED); ok {
+					earlyData = decoded
+					respHeader.Set("Sec-WebSocket-Protocol", rawED)
+				}
+			}
+		}
+		if len(earlyData) == 0 && expectedPath != "/" && strings.HasPrefix(reqPath, expectedPath+"/") {
 			suffix := strings.TrimPrefix(reqPath, expectedPath+"/")
 			if suffix != "" {
-				if decoded, err := base64.RawURLEncoding.DecodeString(suffix); err == nil {
+				if decoded, ok := decodeBase64EarlyData(suffix); ok {
 					earlyData = decoded
 				}
 			}
